@@ -1,32 +1,11 @@
-"""
-phono3py_compat.py
-===================
-Compatibility helpers so the same scripts work correctly across both
-phono3py v3.x and v4.x, which introduced several breaking changes:
+"""phono3py_compat.py
 
-  - v4.0.0: CLI split into `phono3py-init` (setup: displacements, FORCES_FC3
-    /FORCES_FC2 creation, --dim, --dim-fc2, -c) and `phono3py` (phonon /
-    thermal-conductivity calculation). The `phono3py` command now REJECTS
-    --dim, -c, --cf3, --cf2, --cfs, --fs2f2, --rd-fc2, etc.
-  - v4.0.0: compact force constants are now the DEFAULT (was full in v3.x).
-    --cfc/--compact-fc removed; use --full-fc to request full arrays.
-  - v4.0.0: default primitive_matrix changed from identity to "auto".
-  - v4.0.0: Rust backend (phonors) is now the default execution backend.
-  - v4.0.0: grid / tetrahedron-method / kaccum modules migrated from
-    phono3py to phonopy (phonopy.phonon.grid.BZGrid, etc.)
-  - v4.0.1: symfc-projector auto-symmetrization bug from 4.0.0 fixed;
-    traditional symmetrization is again the default, matching v3.
+Compatibility helpers for phono3py v3.x vs v4.x: CLI split into
+phono3py-init/phono3py, compact-FC default, primitive_matrix default,
+Rust backend, and the grid/tetrahedron/kaccum move to phonopy. Imported by
+thermal_transport_agent.py and generate_scph_fc2_fc3_agent.py.
 
 Reference: https://phonopy.github.io/phono3py/migration-v4.html
-           https://phonopy.github.io/phono3py/changelog.html
-
-Usage
------
-    from phono3py_compat import (
-        print_version_banner,
-        get_thermal_conductivity_RTA_compat,
-        recommend_bte_cli,
-    )
 """
 
 from __future__ import annotations

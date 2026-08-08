@@ -1,90 +1,16 @@
 #!/usr/bin/env python
-"""
-scph_to_thermal_conductivity.py
-================================
-Self-consistent phonon (SCPH) loop followed by joint many-body force
-constant fitting and phono3py thermal conductivity preparation.
+"""generate_scph_fc2_fc3_agent.py
 
-The SCPH loop iterates the harmonic model to self-consistency at a given
-temperature.  At each iteration it generates thermally-displaced structures
-and evaluates forces with the MLIP.  This script:
+Self-consistent phonon (SCPH) loop (harmonic FC2 only) followed by a joint
+many-body fit (FC2..FC{N+1}, from --cutoffs) to the accumulated thermal
+displacements, exported to phono3py HDF5. See README.md for the full
+restart/seed/skip-SCPH/select-best-iteration options.
 
-  1. Runs the full SCPH loop (same algorithm as scph_phonon_with_NNP.py),
-     using only the 2nd order (harmonic) part of the model.
-  2. Accumulates the displaced configs + forces from every iteration
-     (or from the last --n_collect iterations) into a single dataset.
-  3. Fits a joint ClusterSpace to that dataset, spanning 2nd order up to
-     whatever order is implied by --cutoffs (see below).
-  4. Converts FC2 (and FC3, if fitted) to phono3py HDF5 (fc2.hdf5,
-     fc3.hdf5). Any higher orders are written to generic fc{n}.hdf5 files.
-
-Body order is derived from --cutoffs
-  The number of cutoffs given determines the highest order fitted:
-      "5.0"           -> 2nd order only
-      "5.0 3.0"       -> 2nd + 3rd order
-      "5.0 3.0 3.0"   -> 2nd, 3rd, and 4th order
-  i.e. N cutoffs fit orders 2..N+1, in the order given. The SCPH loop
-  itself always uses only the first (2nd order) cutoff, since it only
-  needs a harmonic model to generate thermal displacements.
-
-Why accumulate configs across iterations?
-  - Each SCPH iteration generates n_structures configs with forces.
-  - Higher-order fitting needs more data than 2nd order alone.
-  - Later iterations sample the thermally-consistent configuration space
-    around the converged potential, making them the most relevant for the
-    higher-order terms.
-  - Accumulating last n_collect iterations gives a large, well-conditioned
-    dataset without any additional force evaluations.
-
-Usage
------
-    python scph_to_thermal_conductivity.py \\
-        -prim POSCAR-unitcell \\
-        -sdim "2 2 2" \\
-        -model mace.model --head omat_pbe \\
-        -cutoffs "6.0 4.5" \\
-        -temps "100 200 300" \\
-        -N 100 -niter 50 \\
-        -o output/ \\
-        [--n_collect 10]   # use configs from last 10 SCPH iterations for fitting
-        [--qm_statistics]  # quantum Bose-Einstein amplitude
-
-    # Re-fit with a different set of cutoffs (e.g. add a 4th order term),
-    # reusing configs (with forces) from a previous SCPH run -- no MLIP
-    # evaluations, no calc:
-    python scph_to_thermal_conductivity.py \\
-        -prim POSCAR-unitcell \\
-        -sdim "2 2 2" \\
-        -cutoffs "6.0 3.5 3.5" \\
-        -temps "100 200 300" \\
-        -o output/ \\
-        --skip_scph
-
-    # Seed the SCPH loop from an existing fc2.hdf5 (e.g. from a converged
-    # run at a nearby T) instead of small-amplitude rattled structures.
-    # The SCPH loop still iterates to convergence from there:
-    python scph_to_thermal_conductivity.py \\
-        -prim POSCAR-unitcell \\
-        -sdim "2 2 2" \\
-        -model mace.model --head omat_pbe \\
-        -cutoffs "6.0 4.5" \\
-        -temps "300" \\
-        -N 100 -niter 50 \\
-        -o output/ \\
-        --init_fc2 previous_run/T300/fc2.hdf5
-
-    # Same, but skip SCPH refinement entirely: generate one batch of
-    # thermal displacements from the given fc2.hdf5, evaluate forces, and
-    # fit FC2..FCN directly to it (no SCF loop):
-    python scph_to_thermal_conductivity.py \\
-        -prim POSCAR-unitcell \\
-        -sdim "2 2 2" \\
-        -model mace.model --head omat_pbe \\
-        -cutoffs "6.0 4.5" \\
-        -temps "300" \\
-        -N 100 \\
-        -o output/ \\
-        --init_fc2 previous_run/T300/fc2.hdf5 --fc2_only
+    python generate_scph_fc2_fc3_agent.py \\
+        -prim POSCAR-unitcell -sdim "2 2 2" \\
+        --model mace.model --head omat_pbe \\
+        -cutoffs "6.0 4.5" -temps "100 200 300" \\
+        -N 100 -niter 50 -o output/
 """
 
 from __future__ import annotations
@@ -407,6 +333,30 @@ def parameters_from_fc2(
     return extract_parameters(fcs, cs2)
 
 
+def parameters_from_fcp_checkpoint(
+    fcp_path:  str,
+    supercell: Atoms,
+    cs2:       ClusterSpace,
+) -> np.ndarray:
+    """
+    Extract 2nd-order parameters from a saved SCPH checkpoint
+    (fcp_scph/scph_T{T}_iter{i}.fcp or ..._final.fcp) to restart an
+    interrupted run, by projecting its FC2 onto *cs2* -- the same
+    technique --init_fc2 uses for fc2.hdf5.
+    """
+    N = len(supercell)
+    fcp = ForceConstantPotential.read(fcp_path)
+    fc2 = fcp.get_force_constants(supercell).get_fc_array(order=2, format="phonopy")
+    if fc2.shape != (N, N, 3, 3):
+        raise ValueError(
+            f"{fcp_path}: FC2 array has shape {fc2.shape}, expected "
+            f"({N}, {N}, 3, 3) to match the supercell built from "
+            "-prim/-sdim/-pa. Make sure these flags match the run that "
+            "produced this checkpoint."
+        )
+    return parameters_from_fc2(fc2, supercell, cs2)
+
+
 # =============================================================================
 # Locate + load previously saved configs (for --skip_scph)
 # =============================================================================
@@ -425,6 +375,26 @@ def find_config_files(configs_dir: str, T: float) -> list:
 
     files.sort(key=iter_num)
     return files
+
+
+def find_latest_scph_checkpoint(fcp_dir: str, T: float) -> tuple[int, str] | None:
+    """
+    Find the highest-iteration scph_T{T}_iter*.fcp checkpoint in *fcp_dir*
+    (used to auto-resume/extend a run). Returns (iteration, path), or None
+    if no checkpoint exists. Deliberately ignores ..._final.fcp, since its
+    filename doesn't encode which iteration it was written at.
+    """
+    pattern = os.path.join(fcp_dir, f"scph_T{T:.0f}_iter*.fcp")
+    iter_re = re.compile(r"_iter(\d+)\.fcp$")
+
+    best = None
+    for f in glob.glob(pattern):
+        m = iter_re.search(f)
+        if m:
+            it = int(m.group(1))
+            if best is None or it > best[0]:
+                best = (it, f)
+    return best
 
 
 def load_collected_configs(configs_dir: str, T: float, n_collect: int) -> list:
@@ -507,6 +477,8 @@ def run_scph_and_collect(
     random_seed:     int              = 42,
     init_fc2:        np.ndarray | None = None,
     fc2_only:        bool             = False,
+    select_best_iteration: bool       = False,
+    fe_mesh:         list[int] | None = None,
 ) -> tuple[np.ndarray, list, str]:
     """
     Run the SCPH loop on *cs2* (2nd order ClusterSpace) and accumulate
@@ -523,6 +495,13 @@ def run_scph_and_collect(
         displacements directly from init_fc2 at temperature T, evaluate
         forces with the MLIP, and return that batch as collected_configs
         for higher-order fitting.
+    select_best_iteration : if True, track the harmonic free energy F(T)
+        at every iteration (phonopy mesh sum on fe_mesh, no new MLIP
+        evaluations) and anchor the n_collect window of collected configs
+        on the iteration with the lowest F(T) instead of the last
+        iteration. F(T) is not guaranteed to decrease monotonically
+        (stochastic sampling noise each iteration), so this avoids
+        collecting from a worse-than-best snapshot just because it's last.
 
     Returns
     -------
@@ -541,6 +520,9 @@ def run_scph_and_collect(
     # Choose displacement method
     disp_method = DisplacementMethod.PHONOPY if qm_statistics \
                   else DisplacementMethod.HIPHIVE
+
+    if select_best_iteration and fe_mesh is None:
+        fe_mesh = [10, 10, 10]
 
     # ── Initial model ─────────────────────────────────────────────────────
     if parameters_start is None:
@@ -605,8 +587,56 @@ def run_scph_and_collect(
 
     # ── SCPH iterations ───────────────────────────────────────────────────
     # Track which iteration config files are saved so we can collect the
-    # last n_collect of them for FC3 fitting.
+    # last n_collect of them for FC3 fitting. On restart (nstart > 0), seed
+    # this with the config files already on disk from before the
+    # interruption, so --n_collect spans the full run, not just the
+    # iterations run after this restart.
     saved_config_files = []
+    if nstart > 0:
+        iter_re = re.compile(r"_iter(\d+)\.extxyz$")
+        for f in find_config_files(cfg_dir, T):
+            m = iter_re.search(f)
+            if m and int(m.group(1)) < nstart:
+                saved_config_files.append(f)
+        if saved_config_files:
+            print(f"  Restart: found {len(saved_config_files)} pre-existing "
+                  f"config file(s) from iterations < {nstart} in {cfg_dir}")
+
+    # [(iteration, F(T) kJ/mol), ...], only tracked if select_best_iteration.
+    # On restart, recompute F(T) for whichever pre-existing checkpoints are
+    # on disk (only every ckpt_interval iterations were saved), so the
+    # best-iteration search still spans the full run, not just the
+    # iterations run after this restart.
+    #
+    # Checkpoint scph_T{T}_iter{k}.fcp is written *after* iteration k
+    # updates parameters_old, i.e. it holds the model entering iteration
+    # k+1 -- the same model whose free energy the live loop above labels
+    # "iteration k+1". So recovered points must be relabeled it = k + 1.
+    # Iteration 0's own free energy (from the initial, pre-loop model) has
+    # no corresponding checkpoint and cannot be recovered after a restart.
+    free_energies = []
+    if select_best_iteration and nstart > 0:
+        iter_re_fcp = re.compile(r"_iter(\d+)\.fcp$")
+        for f in glob.glob(os.path.join(fcp_dir, f"scph_T{T:.0f}_iter*.fcp")):
+            m = iter_re_fcp.search(f)
+            if not m:
+                continue
+            it = int(m.group(1)) + 1
+            if it >= nstart:
+                continue
+            _, _, _, phonon_prev = phonopysupercell(prim_file, sdim, primitive_matrix)
+            fc2_prev = ForceConstantPotential.read(f).get_force_constants(
+                supercell
+            ).get_fc_array(order=2, format="phonopy")
+            phonon_prev.force_constants = fc2_prev
+            phonon_prev.symmetrize_force_constants()
+            phonon_prev.run_mesh(fe_mesh, is_gamma_center=True)
+            phonon_prev.run_thermal_properties(temperatures=[T], classical=not qm_statistics)
+            free_energies.append((it, float(phonon_prev.thermal_properties.free_energy[0])))
+        if free_energies:
+            print(f"  Restart: recomputed F(T) for {len(free_energies)} "
+                  f"pre-existing checkpoint(s) from iterations < {nstart} "
+                  f"(iteration 0's F(T) cannot be recovered after restart)")
 
     for i in range(nstart, n_iterations):
         t_iter = time.time()
@@ -619,6 +649,15 @@ def run_scph_and_collect(
         N = len(supercell)
         phonon.force_constants = fc2_to_phonopy(fc2_ase, N)
         phonon.symmetrize_force_constants()
+
+        # This FC2 is exactly what will generate this iteration's config
+        # batch below, so its free energy represents that batch's model.
+        if select_best_iteration:
+            phonon.run_mesh(fe_mesh, is_gamma_center=True)
+            phonon.run_thermal_properties(temperatures=[T], classical=not qm_statistics)
+            fe = float(phonon.thermal_properties.free_energy[0])
+            free_energies.append((i, fe))
+            print(f"    F({T:.0f}K) = {fe:.6f} kJ/mol")
 
         # Generate displaced structures
         displaced = generate_displaced_structures(
@@ -671,12 +710,33 @@ def run_scph_and_collect(
     fcp_final.write(fcp_path)
     print(f"\n  Final SCPH FCP -> {fcp_path}")
 
-    # Collect configs from last n_collect iterations
-    collect_files = saved_config_files[-n_collect:]
+    # Collect configs for the higher-order fit: either the last n_collect
+    # iterations (default), or -- if select_best_iteration -- the n_collect
+    # iterations ending at whichever iteration had the lowest F(T), since
+    # F(T) is not guaranteed to decrease monotonically iteration to
+    # iteration (stochastic sampling noise).
+    if select_best_iteration and free_energies:
+        best_iter, best_fe = min(free_energies, key=lambda x: x[1])
+        print(f"\n  --select_best_iteration: lowest F({T:.0f}K) at iteration "
+              f"{best_iter}  (F={best_fe:.6f} kJ/mol)")
+        by_iter = {}
+        iter_re = re.compile(r"_iter(\d+)\.extxyz$")
+        for f in find_config_files(cfg_dir, T):
+            m = iter_re.search(f)
+            if m:
+                by_iter[int(m.group(1))] = f
+        window_start = max(0, best_iter - n_collect + 1)
+        collect_files = [by_iter[j] for j in range(window_start, best_iter + 1)
+                          if j in by_iter]
+        print(f"  Collecting configs from iterations {window_start}..{best_iter} "
+              f"(anchored on best iteration)")
+    else:
+        collect_files = saved_config_files[-n_collect:]
+
     collected = []
     for f in collect_files:
         collected.extend(read(f"{f}@:"))
-    print(f"  Collected {len(collected)} configs from last "
+    print(f"  Collected {len(collected)} configs from "
           f"{len(collect_files)} iterations for FC3 fitting")
 
     return parameters_old, collected, fcp_path
@@ -838,6 +898,7 @@ def main(args):
     primitive_matrix = parse_primitive_matrix(args.primitive_matrix)
     sdim             = parse_sdim(args.sdim)
     cutoffs          = parse_cutoffs(args.cutoffs)
+    fe_mesh          = [int(x) for x in args.fe_mesh.split()]
     max_order        = len(cutoffs) + 1
     temperatures     = np.array(args.temperatures.split(), dtype=float)
     out_dir          = args.outdir
@@ -894,6 +955,14 @@ def main(args):
                 print(f"  Mode             : --fc2_only (single displacement "
                       f"batch from --init_fc2, no SCPH iteration)")
 
+    if args.select_best_iteration:
+        if args.skip_scph or args.fc2_only:
+            print(f"  WARNING: --select_best_iteration is ignored with "
+                  f"--skip_scph/--fc2_only (no SCPH loop runs).")
+        else:
+            print(f"  Select best      : lowest F(T) iteration anchors "
+                  f"--n_collect (fe_mesh={fe_mesh})")
+
     # ── Calculator (not needed if reusing existing forces) ────────────────
     calc = None if args.skip_scph else make_calc(args)
 
@@ -921,11 +990,36 @@ def main(args):
             parameters_start = None
             nstart           = 0
             if args.nstart > 0 and args.initial_parameter_file:
-                params_all       = np.loadtxt(args.initial_parameter_file)
-                parameters_start = params_all[-1] if params_all.ndim > 1 else params_all
-                nstart           = args.nstart
+                # Explicit restart: takes precedence over --resume.
+                parameters_start = parameters_from_fcp_checkpoint(
+                    args.initial_parameter_file, supercell, cs2
+                )
+                nstart = args.nstart
                 print(f"  Restarting from {args.initial_parameter_file}  "
                       f"(nstart={nstart})")
+            elif args.resume and not args.fc2_only:
+                # Auto-resume: reuse the latest checkpoint for this T, if
+                # any, so --n_iterations can simply be raised to extend a
+                # previous run instead of starting over.
+                latest = find_latest_scph_checkpoint(
+                    os.path.join(T_dir, "fcp_scph"), T
+                )
+                if latest is not None:
+                    latest_iter, latest_path = latest
+                    parameters_start = parameters_from_fcp_checkpoint(
+                        latest_path, supercell, cs2
+                    )
+                    nstart = latest_iter + 1
+                    print(f"  --resume: found checkpoint at iteration "
+                          f"{latest_iter} -> {latest_path}  (nstart={nstart})")
+                    if nstart >= args.n_iterations:
+                        print(f"  WARNING: --n_iterations={args.n_iterations} "
+                              f"<= next iteration ({nstart}); no new SCPH "
+                              f"iterations will run. Raise --n_iterations to "
+                              f"extend this run further.")
+                else:
+                    print(f"  --resume: no existing checkpoint found for "
+                          f"T={T:.0f} K, starting from scratch")
 
             # ── SCPH loop — accumulates configs internally ────────────────
             parameters_converged, collected_configs, fcp_path = run_scph_and_collect(
@@ -948,6 +1042,8 @@ def main(args):
                 parameters_start = parameters_start,
                 init_fc2         = init_fc2,
                 fc2_only         = args.fc2_only,
+                select_best_iteration = args.select_best_iteration,
+                fe_mesh          = fe_mesh,
             )
 
         # ── Fit FC2..FC{max_order} jointly to accumulated configs ─────────
@@ -980,10 +1076,10 @@ def main(args):
 {fc_summary}
 
   Thermal conductivity — Python pipeline (recommended, version-agnostic):
-    python thermal_transport_mace.py bte \\
+    python thermal_transport_agent.py bte \\
         --out_dir {T_dir}/ \\
         --mesh "11 11 11" --temperatures "{T:.0f}" \\
-        --solver rta --wigner --parallel_mode serial_gp --resume
+        --solver rta --transport_type SMM19 --parallel_mode serial_gp --resume
 """)
         print(recommend_bte_cli(
             mesh      = "11 11 11",
@@ -1054,9 +1150,27 @@ if __name__ == "__main__":
     p.add_argument("-ckpt",   "--ckpt",          type=int, default=2,
                    help="Save FCP checkpoint every N iterations "
                         "(ignored with --skip_scph)")
-    p.add_argument("-nstart", "--nstart",         type=int, default=0)
+    p.add_argument("-nstart", "--nstart",         type=int, default=0,
+                   help="Restart: iteration to resume at (loop runs "
+                        "range(nstart, n_iterations)). Set to 1 + the "
+                        "iteration number in the --initial_parameter_file "
+                        "checkpoint's filename, so that iteration is not "
+                        "redone. Requires --initial_parameter_file.")
     p.add_argument("-init",   "--initial_parameter_file", default=None,
-                   help="Load initial SCPH parameters from file (for restart)")
+                   help="Restart: path to a saved SCPH checkpoint "
+                        "(fcp_scph/scph_T{T}_iter{i}.fcp) to resume from. "
+                        "Its FC2 is projected onto the ClusterSpace to seed "
+                        "the parameters, the same way --init_fc2 does. "
+                        "Requires -nstart > 0.")
+    p.add_argument("--resume", action="store_true",
+                   help="Auto-resume: for each temperature, reuse the "
+                        "highest-iteration fcp_scph/scph_T{T}_iter*.fcp "
+                        "checkpoint under --outdir, if any, and continue "
+                        "from there -- raise --n_iterations beyond the "
+                        "previous run's to extend it instead of starting "
+                        "over. Ignored if -nstart/--initial_parameter_file "
+                        "are given explicitly (those take precedence), and "
+                        "with --skip_scph/--fc2_only.")
     p.add_argument("--init_fc2", default=None,
                    help="Path to an existing fc2.hdf5 (phono3py format, "
                         "full supercell) used to seed the 2nd-order model "
@@ -1084,6 +1198,22 @@ if __name__ == "__main__":
                         "the last N iteration files with --skip_scph.")
     p.add_argument("--train_size", type=float, default=1.0,
                    help="Fraction of collected data used for training")
+    p.add_argument("--select_best_iteration", action="store_true",
+                   help="Track the harmonic free energy F(T) at every SCPH "
+                        "iteration (cheap phonopy mesh sum on --fe_mesh, no "
+                        "extra MLIP evaluations) and anchor the --n_collect "
+                        "window on the iteration with the LOWEST F(T) "
+                        "instead of the last iteration. F(T) is not "
+                        "guaranteed to decrease monotonically between "
+                        "iterations (stochastic sampling noise), so this "
+                        "avoids training the higher-order fit on a "
+                        "worse-than-best snapshot just because it ran last. "
+                        "Ignored with --skip_scph/--fc2_only.")
+    p.add_argument("--fe_mesh", default="10 10 10",
+                   help="q-point mesh for the per-iteration free energy "
+                        "calc used by --select_best_iteration (lighter than "
+                        "a production kappa mesh -- only ranks iterations, "
+                        "not a final result)")
 
     # Skip SCPH — reuse existing configs (e.g. to re-fit with new cutoffs)
     p.add_argument("--skip_scph", action="store_true",

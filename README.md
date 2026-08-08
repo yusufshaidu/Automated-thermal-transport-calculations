@@ -5,14 +5,15 @@ temperature-dependent lattice thermal conductivity kappa(T), including
 self-consistent phonon (SCPH) renormalization for strongly anharmonic
 materials.
 
-The repository contains **two independent, complementary scripts**, one
-post-processing utility, and one shared helper module:
+The repository contains **two independent, complementary scripts**, two
+post-processing utilities, and one shared helper module:
 
 | File | Purpose |
 |------|---------|
 | [`thermal_transport_agent.py`](#thermal_transport_agentpy) | End-to-end pipeline: relax -> generate displaced supercells -> evaluate forces -> **finite-displacement** FC2/FC3 (phono3py) -> solve the phonon BTE -> kappa(T). Also runs BTE-only or collect-only against FC2/FC3 produced elsewhere (e.g. by the SCPH script). |
 | [`generate_scph_fc2_fc3_agent.py`](#generate_scph_fc2_fc3_agentpy) | Produces **temperature-dependent, anharmonically renormalized** FC2 (plus a jointly-fit FC3/FC4…) via a self-consistent harmonic (SCPH) loop + [hiphive](https://hiphive.materialsmodeling.org/) fitting. Feeds its `fc2.hdf5`/`fc3.hdf5` into `thermal_transport_agent.py bte` for the actual kappa(T) solve. |
-| [`plot_scph_free_energy.py`](#plot_scph_free_energypy) | Post-processes the `.fcp` checkpoints saved by `generate_scph_fc2_fc3_agent.py` and plots the harmonic free energy F(T) vs. SCPH iteration — a convergence diagnostic that requires no new MLIP evaluations. |
+| [`plot_scph_free_energy.py`](#plot_scph_free_energypy) | Post-processes the `.fcp` checkpoints saved by `generate_scph_fc2_fc3_agent.py` and plots free energy F(T) and minimum phonon frequency vs. SCPH iteration — convergence/stability diagnostics that need no new MLIP evaluations. |
+| [`plot_scph_bands.py`](#plot_scph_bandspy) | Overlays the phonon band structure from the same `.fcp` checkpoints along one auto-detected high-symmetry path, colored by SCPH iteration. |
 | [`phono3py_compat.py`](#phono3py_compatpy) | Version-compatibility shim (phono3py v3.x vs v4.x). Imported by both pipeline scripts above — **must live in the same directory**. |
 
 Use `thermal_transport_agent.py` on its own for standard 0 K (or
@@ -45,6 +46,7 @@ strongly anharmonic lattices, imaginary frequencies from a static FC2).
   - [Usage examples](#usage-examples)
 - [Connecting the two scripts](#connecting-the-two-scripts)
 - [`plot_scph_free_energy.py`](#plot_scph_free_energypy)
+- [`plot_scph_bands.py`](#plot_scph_bandspy)
 - [`phono3py_compat.py`](#phono3py_compatpy)
 - [Tips and troubleshooting](#tips-and-troubleshooting)
 
@@ -69,8 +71,12 @@ pip install phono3py phonopy h5py
 # ASE
 pip install ase
 
-# hiphive + trainstation (needed only for generate_scph_fc2_fc3_agent.py)
+# hiphive + trainstation (needed only for generate_scph_fc2_fc3_agent.py
+# and the plot_scph_*.py post-processing scripts)
 pip install hiphive trainstation
+
+# seekpath (needed only for plot_scph_bands.py — auto high-symmetry path)
+pip install seekpath
 
 # optional — UMA calculator backend (--calc_type uma)
 pip install fairchem-core
@@ -489,8 +495,9 @@ There are no subcommands — a single flat argument list.
 | `--qm_statistics` | off | Quantum Bose-Einstein vs. classical Maxwell-Boltzmann displacement amplitude (ignored with `--skip_scph`) |
 | `--imag_freq_factor` | `1.0` | — |
 | `-ckpt` / `--ckpt` | `2` | Checkpoint FCP every N iterations (ignored with `--skip_scph`) |
-| `-nstart` / `--nstart` | `0` | Iteration to resume from |
-| `-init` / `--initial_parameter_file` | *(none)* | Restart: load initial SCPH parameters from a saved file |
+| `--resume` | off | Auto-resume: reuse the highest `fcp_scph/scph_T{T}_iter*.fcp` checkpoint under `--outdir` per temperature and continue from there. Raise `--n_iterations` beyond the previous run's to extend it. Overridden by explicit `-nstart`/`-init`; ignored with `--skip_scph`/`--fc2_only`. |
+| `-nstart` / `--nstart` | `0` | Manual restart: iteration to resume at. Takes precedence over `--resume` |
+| `-init` / `--initial_parameter_file` | *(none)* | Manual restart: path to a saved `fcp_scph/scph_T{T}_iter{i}.fcp` checkpoint to resume from |
 | `--init_fc2` | *(none)* | Seed the harmonic model from an existing `fc2.hdf5` |
 | `--fc2_only` | off | Requires `--init_fc2`; single displacement batch, no SCPH loop |
 
@@ -500,6 +507,8 @@ There are no subcommands — a single flat argument list.
 |---|---|---|
 | `--n_collect` | `10` | Configs from the last N iterations used for the higher-order fit |
 | `--train_size` | `1.0` | Fraction of collected data used for training |
+| `--select_best_iteration` | off | Anchor the `--n_collect` window on the lowest-F(T) iteration instead of the last one (see below) |
+| `--fe_mesh` | `"10 10 10"` | q-point mesh for `--select_best_iteration`'s per-iteration free energy calc |
 
 **Skip-SCPH**
 
@@ -513,10 +522,42 @@ Validation: `--n_collect` is clamped (with a warning) to `--n_iterations` if
 larger; `--fc2_only` requires `--init_fc2` and is mutually exclusive with
 `--skip_scph`.
 
+### Selecting the best iteration for the higher-order fit
+
+F(T) is not guaranteed to decrease monotonically between SCPH iterations --
+each iteration's parameters are fit to a different random batch of thermal
+displacements, so the free energy naturally fluctuates with that sampling
+noise. By default, `--n_collect` always anchors its window on the *last*
+iteration, which may not be the best one.
+
+`--select_best_iteration` tracks F(T) at every iteration (a phonopy mesh sum
+on `--fe_mesh` -- cheap, no extra MLIP evaluations, since it reuses the FC2
+already built that iteration) and instead anchors the `--n_collect` window
+on whichever iteration had the *lowest* F(T), reusing that iteration's
+already-saved configs (again, no extra MLIP evaluations). Combined with
+`--resume`, F(T) for pre-restart iterations is recomputed from their
+checkpoints so the best-iteration search still spans the whole run -- except
+iteration 0's, which has no corresponding checkpoint and can't be recovered
+after a restart.
+
 ### Restart / seed / skip modes
 
-- **Restart a crashed SCPH run**: `-nstart N -init <params file>` resumes
-  the loop from iteration `N` using previously saved parameters.
+- **Continue an interrupted or too-short run**: add `--resume` and (if you
+  want more iterations than originally requested) raise `--n_iterations`.
+  For each temperature, it finds the highest-numbered
+  `fcp_scph/scph_T{T}_iter{i}.fcp` checkpoint already on disk, projects its
+  FC2 back onto the ClusterSpace to seed the parameters, and continues the
+  loop at iteration `i + 1` — the completed iterations are not redone, and
+  their already-saved `.extxyz` configs are folded back into `--n_collect`'s
+  window so the higher-order fit still sees the full run. If
+  `--n_iterations` isn't raised past `i + 1`, it prints a warning and
+  no-ops (nothing left to run). If no checkpoint exists yet for that
+  temperature, it just starts from scratch.
+- **Restart at a specific iteration with a specific checkpoint** (manual
+  equivalent of `--resume`, e.g. to roll back a few iterations): `-nstart N
+  -init <fcp_scph/scph_T{T}_iter{N-1}.fcp>` resumes the loop at iteration
+  `N`, seeding parameters from that checkpoint's FC2. Explicit `-nstart`/
+  `-init` always take precedence over `--resume`.
 - **Seed from a converged FC2 at another temperature/setting**:
   `--init_fc2 previous_run/T300/fc2.hdf5` initializes the loop without
   rattled-structure fitting; add `--fc2_only` to skip iterative refinement
@@ -637,11 +678,17 @@ the SCPH loop actually converged at that temperature — see
 
 The SCPH loop has no automatic convergence check — it just runs
 `--n_iterations` and prints the relative parameter change for you to judge
-by eye. This script computes a more physical diagnostic instead: for each
+by eye. This script computes two more physical diagnostics instead: for each
 checkpointed `fcp_scph/scph_T{T}_iter{i}.fcp` (and `..._final.fcp`), it
-rebuilds the FC2, symmetrizes it, and computes the harmonic phonon free
-energy F(T) with phonopy on a q-point mesh. Plotting F(T) vs. iteration shows
-whether the loop actually plateaued. No new MLIP evaluations are needed.
+rebuilds the FC2, symmetrizes it, and computes on a phonopy q-point mesh (a)
+the harmonic free energy F(T) and (b) the minimum phonon frequency anywhere
+on the mesh, *excluding* the 3 acoustic bands at Gamma (which are trivially
+~0 for any structure, stable or not, by translational invariance — including
+them would make the minimum always read ~0 regardless of real instabilities
+elsewhere in the Brillouin zone). Plotting both vs. iteration shows whether
+the loop actually plateaued, and whether any mode is still (or newly)
+dynamically unstable (negative/imaginary frequency). No new MLIP evaluations
+are needed.
 
 ```bash
 python plot_scph_free_energy.py \
@@ -657,11 +704,38 @@ array itself, not on `fcp.primitive_structure` (hiphive's own
 symmetry-reduced primitive, e.g. 1 atom for a cubic lattice), which is not
 comparable to the supercell size and would give a false mismatch.
 
-Outputs per temperature: `<outdir>/T{T:.0f}/free_energy_vs_scph_iteration.json`
-and `..._iteration.png` (F(T) vs. iteration, final value marked as a dashed
-line). `--classical` switches from quantum (Bose-Einstein, default) to
-classical (Boltzmann) statistics. A flat curve means the SCPH loop converged;
-a still-drifting one means raise `--n_iterations` or lower `--alpha`.
+Outputs per temperature: `<outdir>/T{T:.0f}/scph_convergence.json` (raw
+iteration -> free energy / min-frequency values) and `scph_convergence.png`
+(two stacked panels vs. iteration, final value marked as a dashed line).
+`--classical` switches from quantum (Bose-Einstein, default) to classical
+(Boltzmann) statistics for the free energy. A flat F(T) curve means the SCPH
+loop converged; a still-drifting one means raise `--n_iterations` or lower
+`--alpha`. A minimum frequency that stays negative means the structure is
+still dynamically unstable at that temperature even after SCPH renormalization.
+
+---
+
+## `plot_scph_bands.py`
+
+Overlays the phonon band structure from every checkpointed `.fcp` (same
+files as above) along a single high-symmetry path, colored by SCPH
+iteration, with the final fit drawn in bold black. This shows directly how
+each branch moves (softening, hardening, avoided crossings) as the SCPH loop
+converges — a more detailed view than the single min-frequency number from
+`plot_scph_free_energy.py`.
+
+```bash
+python plot_scph_bands.py \
+    -prim POSCAR-unitcell -sdim "2 2 2" -o output/ \
+    -temps "300" --npoints 101
+```
+
+The high-symmetry path is auto-detected once (via phonopy + `seekpath`, from
+the primitive structure — `pip install seekpath`) and reused for every
+iteration, so all curves share exactly the same q-points. `--stride N` plots
+only every Nth checkpointed iteration (the final fit is always included) to
+keep the plot legible when there are many checkpoints. Output:
+`<outdir>/T{T:.0f}/bands_vs_scph_iteration.png`.
 
 ---
 

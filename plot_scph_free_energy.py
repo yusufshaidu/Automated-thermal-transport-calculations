@@ -1,4 +1,4 @@
-"""Plot harmonic free energy F(T) vs. SCPH iteration from saved .fcp checkpoints.
+"""Plot free energy F(T) and minimum phonon frequency vs. SCPH iteration from saved .fcp checkpoints.
 
 python plot_scph_free_energy.py -prim POSCAR-unitcell -sdim "2 2 2" \\
     -o output/ -temps "100 200 300" --mesh "20 20 20"
@@ -49,15 +49,8 @@ def find_scph_checkpoints(outdir: str, T: float) -> list[tuple[float, str]]:
     return found
 
 
-def free_energy_from_fcp(
-    fcp_path:  str,
-    supercell,
-    phonon,
-    mesh:      list[int],
-    T:         float,
-    classical: bool,
-) -> float:
-    """Return the harmonic free energy (kJ/mol) at T from a saved FCP's FC2."""
+def load_fc2_into_phonon(fcp_path: str, supercell, phonon) -> np.ndarray:
+    """Load an FCP's FC2 into *phonon* (symmetrized), after a shape check."""
     N = len(supercell)
 
     fcp = ForceConstantPotential.read(fcp_path)
@@ -76,10 +69,37 @@ def free_energy_from_fcp(
 
     phonon.force_constants = fc2
     phonon.symmetrize_force_constants()
-    phonon.run_mesh(mesh, is_gamma_center=True)
-    phonon.run_thermal_properties(temperatures=[T], classical=classical)
+    return fc2
 
-    return float(phonon.thermal_properties.free_energy[0])   # kJ/mol
+
+def analyze_fcp(
+    fcp_path:  str,
+    supercell,
+    phonon,
+    mesh:      list[int],
+    T:         float,
+    classical: bool,
+) -> tuple[float, float]:
+    """Return (free_energy [kJ/mol], min_frequency [THz]) at T from a saved FCP."""
+    load_fc2_into_phonon(fcp_path, supercell, phonon)
+    phonon.run_mesh(mesh, is_gamma_center=True)
+
+    # The 3 acoustic bands at Gamma are trivially ~0 by translational
+    # invariance, for any structure, stable or not -- excluding them from
+    # the minimum is what makes this a real instability check rather than
+    # always reporting ~0 regardless of what happens elsewhere in the BZ.
+    freqs   = phonon.mesh.frequencies.copy()
+    qpoints = phonon.mesh.qpoints
+    gamma_rows = np.where(np.all(np.abs(qpoints) < 1e-8, axis=1))[0]
+    for row in gamma_rows:
+        acoustic = np.argsort(freqs[row])[:3]
+        freqs[row, acoustic] = np.inf
+    min_freq = float(np.min(freqs))
+
+    phonon.run_thermal_properties(temperatures=[T], classical=classical)
+    free_energy = float(phonon.thermal_properties.free_energy[0])
+
+    return free_energy, min_freq
 
 
 def plot_convergence(results: dict, outdir: str, classical: bool) -> None:
@@ -88,22 +108,32 @@ def plot_convergence(results: dict, outdir: str, classical: bool) -> None:
     import matplotlib.pyplot as plt
 
     for T, points in results.items():
-        iters = [p[0] for p in points if np.isfinite(p[0])]
-        fe    = [p[1] for p in points if np.isfinite(p[0])]
-        final = next((p[1] for p in points if not np.isfinite(p[0])), None)
+        iters    = [p[0] for p in points if np.isfinite(p[0])]
+        fe       = [p[1] for p in points if np.isfinite(p[0])]
+        min_freq = [p[2] for p in points if np.isfinite(p[0])]
+        fe_final    = next((p[1] for p in points if not np.isfinite(p[0])), None)
+        freq_final  = next((p[2] for p in points if not np.isfinite(p[0])), None)
 
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(iters, fe, "o-", label="SCPH iteration")
-        if final is not None:
-            ax.axhline(final, color="k", ls="--", lw=1, label="final (collected fit)")
-        ax.set_xlabel("SCPH iteration")
-        ax.set_ylabel("Free energy F(T) [kJ/mol]")
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 7), sharex=True)
+
+        ax1.plot(iters, fe, "o-")
+        if fe_final is not None:
+            ax1.axhline(fe_final, color="k", ls="--", lw=1, label="final (collected fit)")
+            ax1.legend()
+        ax1.set_ylabel("Free energy F(T) [kJ/mol]")
+
+        ax2.plot(iters, min_freq, "o-", color="tab:red")
+        ax2.axhline(0, color="gray", ls=":", lw=1)
+        if freq_final is not None:
+            ax2.axhline(freq_final, color="k", ls="--", lw=1)
+        ax2.set_ylabel("Min frequency [THz]")
+        ax2.set_xlabel("SCPH iteration")
+
         stat = "classical" if classical else "quantum"
-        ax.set_title(f"T = {T:.0f} K  ({stat} statistics)")
-        ax.legend()
+        ax1.set_title(f"T = {T:.0f} K  ({stat} statistics)")
         fig.tight_layout()
 
-        out_png = os.path.join(outdir, f"T{T:.0f}", "free_energy_vs_scph_iteration.png")
+        out_png = os.path.join(outdir, f"T{T:.0f}", "scph_convergence.png")
         fig.savefig(out_png, dpi=150)
         plt.close(fig)
         print(f"  wrote {out_png}")
@@ -111,7 +141,7 @@ def plot_convergence(results: dict, outdir: str, classical: bool) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Plot harmonic free energy vs. SCPH iteration from saved .fcp checkpoints.",
+        description="Plot free energy and min phonon frequency vs. SCPH iteration from saved .fcp checkpoints.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-prim", "--prim_file", required=True,
@@ -125,7 +155,7 @@ def main() -> None:
     p.add_argument("-temps", "--temperatures", required=True,
                    help="Space-separated temperatures (K) to plot, e.g. \"100 200 300\"")
     p.add_argument("--mesh", default="20 20 20",
-                   help="q-point mesh for the thermal-properties calculation")
+                   help="q-point mesh for the thermal-properties/frequency calculation")
     p.add_argument("--classical", action="store_true",
                    help="Use classical (Boltzmann) statistics instead of quantum (Bose-Einstein)")
 
@@ -146,20 +176,20 @@ def main() -> None:
         checkpoints = find_scph_checkpoints(args.outdir, T)
         points = []
         for it, path in checkpoints:
-            fe = free_energy_from_fcp(
-                path, supercell, phonon, mesh, T, args.classical
-            )
+            fe, min_freq = analyze_fcp(path, supercell, phonon, mesh, T, args.classical)
             label = "final" if not np.isfinite(it) else f"iter {int(it)}"
-            print(f"  {label:>10s}  F = {fe:.6f} kJ/mol   ({os.path.basename(path)})")
-            points.append((it, fe))
+            print(f"  {label:>10s}  F = {fe:.6f} kJ/mol   min_freq = {min_freq:.4f} THz   "
+                  f"({os.path.basename(path)})")
+            points.append((it, fe, min_freq))
         results[T] = points
 
-        summary_path = os.path.join(args.outdir, f"T{T:.0f}", "free_energy_vs_scph_iteration.json")
+        summary_path = os.path.join(args.outdir, f"T{T:.0f}", "scph_convergence.json")
         with open(summary_path, "w") as f:
             json.dump(
                 {"temperature": T, "mesh": mesh, "classical": args.classical,
                  "points": [{"iteration": (None if not np.isfinite(it) else int(it)),
-                             "free_energy_kJ_per_mol": fe} for it, fe in points]},
+                             "free_energy_kJ_per_mol": fe,
+                             "min_frequency_THz": min_freq} for it, fe, min_freq in points]},
                 f, indent=2,
             )
         print(f"  wrote {summary_path}")

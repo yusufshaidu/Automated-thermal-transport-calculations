@@ -1,50 +1,16 @@
 #!/usr/bin/env python
-"""
-thermal_transport_mace.py
-=========================
-Automated lattice thermal conductivity pipeline using MACE / UMA + phono3py.
+"""thermal_transport_agent.py
 
-Workflow
---------
-1. Read POSCAR / CIF
-2. Variable-cell relaxation  (ASE + calculator + FrechetCellFilter)
-3. Generate displaced supercells  (phono3py Python API)
-4. Evaluate forces  (MACE or UMA, optional DFT-D3 dispersion)
-5. Produce FC2 + FC3  (phono3py Python API)
-6. Solve phonon BTE:
-      solver         : "rta"  -> single-mode RTA  (fast)
-                       "lbte" -> iterative BTE    (accurate)
-      transport_type : None    -> kappa_P only (standard particle-like RTA/LBTE)
-                       "SMM19" -> kappa_P + kappa_C, Simoncelli-Marzari-Mauri (2019)
-                                 Wigner transport equation
-                       "NJC23" -> kappa_P + kappa_C, alternative inter-band formulation
-                       "IBDB19"-> kappa_P + kappa_C, Isaeva-Barbalinardo-Donadio-Baroni
-                                 (2019) formulation
-   Parallelism modes:
-      serial      : all q at once, one process, no disk writes mid-run
-      serial_gp   : one q at a time, kappa-m*-g*.hdf5 written after each q,
-                    per-q resume via checkpoint + disk scan on restart
-      omp         : same as serial; OMP_NUM_THREADS controls threads
-      grid_points : split irreducible q across Python workers / SLURM arrays
-7. Collect per-q kappa-m*-g*.hdf5 -> final kappa-m*.hdf5
-8. Write results + plots
+Automated lattice thermal conductivity pipeline: relax -> displaced
+supercells -> forces (MACE/UMA) -> FC2/FC3 (phono3py) -> BTE -> kappa(T).
+Subcommands: full, bte, collect. See `--help` for the parallel_mode summary
+and progress-monitoring snippet, and README.md for the full walkthrough.
 
-Resume behaviour (serial_gp)
------------------------------
-On every restart _sync_gp_progress() reconciles:
-  - kappa-m{mesh}-g{N}.hdf5 files present on disk
-  - done_gps list stored in checkpoint.json
-The union is trusted; checkpoint wins only when the file also exists.
-Progress is written to checkpoint.json after EVERY q-point so a killed
-job loses at most one q-point of work.
-
-Monitor progress without logging in:
-  python3 -c "
-  import json; from pathlib import Path
-  d = json.loads(Path('results/checkpoint.json').read_text())
-  p = d.get('gp_progress', {})
-  print(f\"{len(d.get('done_gps',[]))} q-pts done | {p.get('pct','?')}% | last={p.get('last_gp','?')}\")
-  "
+    python thermal_transport_agent.py full \\
+        --structure POSCAR --mace_model mace.model \\
+        --supercell "2 2 2" --cutoff_pair 5.0 --mesh "19 19 19" \\
+        --temperatures "300" --solver rta --transport_type SMM19 \\
+        --out_dir results/ --resume
 """
 
 from __future__ import annotations
@@ -1919,7 +1885,7 @@ def _add_bte_args(p: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
-        prog        = "agent_for_thermal_transport_v2.py",
+        prog        = "thermal_transport_agent.py",
         description = "MACE / UMA + phono3py thermal transport pipeline.",
         formatter_class = argparse.RawDescriptionHelpFormatter,
         epilog = """
