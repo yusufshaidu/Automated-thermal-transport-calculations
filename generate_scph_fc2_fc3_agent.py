@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import logging
 import os
 import re
 import time
@@ -40,6 +41,27 @@ from phono3py.file_IO import write_fc2_to_hdf5, write_fc3_to_hdf5, read_fc2_from
 from phono3py_compat import print_version_banner, recommend_bte_cli
 
 from enum import Enum
+
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+def setup_logging(out_dir: str, name: str) -> logging.Logger:
+    """File-only logger at out_dir/pipeline_scph.log, appended to (not
+    overwritten) across restarts/reruns. *name* must be unique per T (e.g.
+    f"scph_T{T:.0f}") since logging.getLogger() caches by name -- reusing a
+    name across different out_dir values would silently keep writing into
+    the first out_dir's file."""
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    h = logging.FileHandler(os.path.join(out_dir, "pipeline_scph.log"))
+    h.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s"))
+    logger.addHandler(h)
+    logger.propagate = False
+    return logger
 
 
 # =============================================================================
@@ -462,6 +484,20 @@ def load_explicit_configs(configs_arg: str) -> list:
 # SCPH loop + accumulate configs
 # =============================================================================
 
+def _min_nonacoustic_freq(phonon) -> float:
+    """Min phonon frequency over the current mesh, excluding the 3 trivially
+    ~0 acoustic bands at Gamma (translational invariance) -- so this is a
+    real instability check, not just ~0 regardless of what happens
+    elsewhere in the BZ. Requires phonon.run_mesh() to have been called."""
+    freqs   = phonon.mesh.frequencies.copy()
+    qpoints = phonon.mesh.qpoints
+    gamma_rows = np.where(np.all(np.abs(qpoints) < 1e-8, axis=1))[0]
+    for row in gamma_rows:
+        acoustic = np.argsort(freqs[row])[:3]
+        freqs[row, acoustic] = np.inf
+    return float(np.min(freqs))
+
+
 def run_scph_and_collect(
     supercell:       Atoms,
     cs2:             ClusterSpace,    # 2nd order only (SCPH)
@@ -486,6 +522,8 @@ def run_scph_and_collect(
     fc2_only:        bool             = False,
     select_best_iteration: bool       = False,
     fe_mesh:         list[int] | None = None,
+    stability_tol:   float            = -0.01,
+    log:             logging.Logger | None = None,
 ) -> tuple[np.ndarray, list, str]:
     """
     Run the SCPH loop on *cs2* (2nd order ClusterSpace) and accumulate
@@ -509,6 +547,15 @@ def run_scph_and_collect(
         iteration. F(T) is not guaranteed to decrease monotonically
         (stochastic sampling noise each iteration), so this avoids
         collecting from a worse-than-best snapshot just because it's last.
+        The lowest F(T) is picked only among iterations whose FC2 has no
+        imaginary (non-acoustic-Gamma) mode on fe_mesh -- otherwise the
+        selection can lock onto an unstable model that merely has a low
+        harmonic free energy. If no iteration is stable, raises
+        RuntimeError rather than silently returning an unstable model.
+    stability_tol : a mesh frequency (THz) is treated as imaginary only if
+        it falls below this (negative) tolerance, to avoid rejecting an
+        otherwise-stable iteration over near-zero numerical/symmetrization
+        noise in a soft optical mode.
 
     Returns
     -------
@@ -520,6 +567,14 @@ def run_scph_and_collect(
                                (or the single fc2_only batch)
     """
     from hiphive.force_constant_model import ForceConstantModel
+
+    if log:
+        log.info(f"SCPH start: T={T:.0f}K  n_iterations={n_iterations}  "
+                 f"n_structures={n_structures}  alpha={alpha}  "
+                 f"qm_statistics={qm_statistics}  fc2_only={fc2_only}  "
+                 f"select_best_iteration={select_best_iteration}"
+                 + (f"  fe_mesh={fe_mesh}  stability_tol={stability_tol}"
+                    if select_best_iteration else ""))
 
     sc  = StructureContainer(cs2)
     fcm = ForceConstantModel(supercell, cs2)
@@ -589,6 +644,9 @@ def run_scph_and_collect(
         fcp_path = os.path.join(fcp_dir, f"scph_T{T:.0f}_final.fcp")
         ForceConstantPotential(cs2, parameters_old).write(fcp_path)
         print(f"  fc2-only FCP (from --init_fc2, unrefined) -> {fcp_path}")
+        if log:
+            log.info(f"Model chosen: fc2_only, unrefined --init_fc2 -> {fcp_path} "
+                     f"(F(T)/min_freq not evaluated)")
 
         return parameters_old, tagged, fcp_path
 
@@ -638,8 +696,11 @@ def run_scph_and_collect(
             phonon_prev.force_constants = fc2_prev
             phonon_prev.symmetrize_force_constants()
             phonon_prev.run_mesh(fe_mesh, is_gamma_center=True)
+            min_freq_prev = _min_nonacoustic_freq(phonon_prev)
             phonon_prev.run_thermal_properties(temperatures=[T], classical=not qm_statistics)
-            free_energies.append((it, float(phonon_prev.thermal_properties.free_energy[0])))
+            free_energies.append(
+                (it, float(phonon_prev.thermal_properties.free_energy[0]), min_freq_prev)
+            )
         if free_energies:
             print(f"  Restart: recomputed F(T) for {len(free_energies)} "
                   f"pre-existing checkpoint(s) from iterations < {nstart} "
@@ -659,12 +720,14 @@ def run_scph_and_collect(
 
         # This FC2 is exactly what will generate this iteration's config
         # batch below, so its free energy represents that batch's model.
+        fe_i, min_freq_i = None, None
         if select_best_iteration:
             phonon.run_mesh(fe_mesh, is_gamma_center=True)
+            min_freq_i = _min_nonacoustic_freq(phonon)
             phonon.run_thermal_properties(temperatures=[T], classical=not qm_statistics)
-            fe = float(phonon.thermal_properties.free_energy[0])
-            free_energies.append((i, fe))
-            print(f"    F({T:.0f}K) = {fe:.6f} kJ/mol")
+            fe_i = float(phonon.thermal_properties.free_energy[0])
+            free_energies.append((i, fe_i, min_freq_i))
+            print(f"    F({T:.0f}K) = {fe_i:.6f} kJ/mol   min_freq = {min_freq_i:.4f} THz")
 
         # Generate displaced structures
         displaced = generate_displaced_structures(
@@ -704,28 +767,63 @@ def run_scph_and_collect(
               f"disp_max={np.max(np.abs(disps)):.4f} Å  "
               f"({time.time()-t_iter:.0f}s)")
 
+        if log:
+            log.info(
+                f"iter {i}: rmse={opt.rmse_train:.5f}  "
+                f"|delta_x|/|x|={delta_x_norm:.6f}"
+                + (f"  F({T:.0f}K)={fe_i:.6f} kJ/mol  min_freq={min_freq_i:.4f} THz"
+                   if select_best_iteration else "")
+            )
+
         parameters_old = parameters_new
 
         # Checkpoint
         if i % ckpt_interval == 0:
             fcp_ckpt = ForceConstantPotential(cs2, parameters_old)
-            fcp_ckpt.write(os.path.join(fcp_dir, f"scph_T{T:.0f}_iter{i}.fcp"))
+            ckpt_path = os.path.join(fcp_dir, f"scph_T{T:.0f}_iter{i}.fcp")
+            fcp_ckpt.write(ckpt_path)
+            if log:
+                log.info(f"checkpoint saved: iter {i} -> {ckpt_path}")
 
     # Save final FCP
     fcp_final = ForceConstantPotential(cs2, parameters_old)
     fcp_path  = os.path.join(fcp_dir, f"scph_T{T:.0f}_final.fcp")
     fcp_final.write(fcp_path)
     print(f"\n  Final SCPH FCP -> {fcp_path}")
+    if log:
+        log.info(f"final SCPH FCP -> {fcp_path}")
 
     # Collect configs for the higher-order fit: either the last n_collect
     # iterations (default), or -- if select_best_iteration -- the n_collect
-    # iterations ending at whichever iteration had the lowest F(T), since
+    # iterations ending at whichever iteration had the lowest F(T) among
+    # iterations with no imaginary (non-acoustic-Gamma) mode on fe_mesh, since
     # F(T) is not guaranteed to decrease monotonically iteration to
-    # iteration (stochastic sampling noise).
+    # iteration (stochastic sampling noise), and a low F(T) from an unstable
+    # model is not a meaningful comparison to a stable one.
     if select_best_iteration and free_energies:
-        best_iter, best_fe = min(free_energies, key=lambda x: x[1])
-        print(f"\n  --select_best_iteration: lowest F({T:.0f}K) at iteration "
-              f"{best_iter}  (F={best_fe:.6f} kJ/mol)")
+        stable = [x for x in free_energies if x[2] > stability_tol]
+        if not stable:
+            worst = min(free_energies, key=lambda x: x[2])
+            msg = (f"--select_best_iteration: no SCPH iteration for T={T:.0f}K "
+                   f"had an all-real spectrum on fe_mesh={fe_mesh} "
+                   f"(stability_tol={stability_tol} THz); least-imaginary was "
+                   f"iteration {worst[0]} with min_freq={worst[2]:.4f} THz. "
+                   f"Refusing to select an unstable model -- rerun with more "
+                   f"iterations, a larger --fe_mesh, looser --stability_tol, "
+                   f"or inspect the run with plot_scph_free_energy.py.")
+            if log:
+                log.error(msg)
+            raise RuntimeError(msg)
+
+        best_iter, best_fe, best_min_freq = min(stable, key=lambda x: x[1])
+        print(f"\n  --select_best_iteration: lowest F({T:.0f}K) among stable "
+              f"iterations at iteration {best_iter}  (F={best_fe:.6f} kJ/mol, "
+              f"min_freq={best_min_freq:.4f} THz)")
+        if log:
+            log.info(f"Model chosen: iteration {best_iter}  "
+                     f"F({T:.0f}K)={best_fe:.6f} kJ/mol  "
+                     f"min_freq={best_min_freq:.4f} THz  (stable; lowest F(T) "
+                     f"among {len(stable)}/{len(free_energies)} stable iterations)")
         by_iter = {}
         iter_re = re.compile(r"_iter(\d+)\.extxyz$")
         for f in find_config_files(cfg_dir, T):
@@ -739,12 +837,19 @@ def run_scph_and_collect(
               f"(anchored on best iteration)")
     else:
         collect_files = saved_config_files[-n_collect:]
+        if log:
+            log.info(f"Model chosen: final iteration {n_iterations - 1} "
+                     f"(--select_best_iteration not used; F(T)/min_freq not "
+                     f"evaluated per-iteration)")
 
     collected = []
     for f in collect_files:
         collected.extend(read(f"{f}@:"))
     print(f"  Collected {len(collected)} configs from "
           f"{len(collect_files)} iterations for FC3 fitting")
+    if log:
+        log.info(f"Collected {len(collected)} configs from "
+                 f"{len(collect_files)} iterations for FC3 fitting")
 
     return parameters_old, collected, fcp_path
 
@@ -967,8 +1072,9 @@ def main(args):
             print(f"  WARNING: --select_best_iteration is ignored with "
                   f"--skip_scph/--fc2_only (no SCPH loop runs).")
         else:
-            print(f"  Select best      : lowest F(T) iteration anchors "
-                  f"--n_collect (fe_mesh={fe_mesh})")
+            print(f"  Select best      : lowest F(T) among stable iterations "
+                  f"anchors --n_collect (fe_mesh={fe_mesh}, "
+                  f"stability_tol={args.stability_tol})")
 
     # ── Calculator (not needed if reusing existing forces) ────────────────
     calc = None if args.skip_scph else make_calc(args)
@@ -981,6 +1087,15 @@ def main(args):
 
         T_dir = os.path.join(out_dir, f"T{T:.0f}")
         os.makedirs(T_dir, exist_ok=True)
+
+        # Unique logger name per T -- logging.getLogger() caches by name, so
+        # reusing one name across temperatures would keep writing into
+        # whichever T_dir/pipeline.log was opened first.
+        log = setup_logging(T_dir, name=f"scph_T{T:.0f}")
+        log.info(f"=== T={T:.0f}K  cutoffs={cutoffs}  sdim={args.sdim}  "
+                 f"calc={args.calc_type}  mode="
+                 + ("skip_scph" if args.skip_scph
+                    else "fc2_only" if args.fc2_only else "scph"))
 
         if args.skip_scph:
             # ── Reuse configs from a previous SCPH run ────────────────────
@@ -1052,9 +1167,13 @@ def main(args):
                 fc2_only         = args.fc2_only,
                 select_best_iteration = args.select_best_iteration,
                 fe_mesh          = fe_mesh,
+                stability_tol    = args.stability_tol,
+                log              = log,
             )
 
         # ── Fit FC2..FC{max_order} jointly to accumulated configs ─────────
+        log.info(f"Fitting joint FC2..FC{max_order} to "
+                 f"{len(collected_configs)} collected configs")
         fcp_all = fit_force_constants(
             supercell  = supercell,
             configs    = collected_configs,
@@ -1065,6 +1184,7 @@ def main(args):
         fcp_path_out = os.path.join(T_dir, f"fcp_order2to{max_order}.fcp")
         fcp_all.write(fcp_path_out)
         print(f"  Joint FCP written -> {fcp_path_out}")
+        log.info(f"Joint FCP written -> {fcp_path_out}")
 
         # ── Export force constants to phono3py HDF5 (+ generic for order>3)
         print("\n  Exporting force constants …")
@@ -1072,6 +1192,7 @@ def main(args):
         fc_all = export_to_phono3py(
             fcp_all, supercell, phonon_T, T_dir, max_order=max_order
         )
+        log.info(f"Exported fc2..fc{max_order} to {T_dir}  -- done")
 
         dim_str    = " ".join(map(str, sdim))
         fc_summary = "\n".join(
@@ -1210,13 +1331,24 @@ if __name__ == "__main__":
                    help="Track the harmonic free energy F(T) at every SCPH "
                         "iteration (cheap phonopy mesh sum on --fe_mesh, no "
                         "extra MLIP evaluations) and anchor the --n_collect "
-                        "window on the iteration with the LOWEST F(T) "
-                        "instead of the last iteration. F(T) is not "
-                        "guaranteed to decrease monotonically between "
-                        "iterations (stochastic sampling noise), so this "
-                        "avoids training the higher-order fit on a "
-                        "worse-than-best snapshot just because it ran last. "
-                        "Ignored with --skip_scph/--fc2_only.")
+                        "window on the iteration with the LOWEST F(T) among "
+                        "iterations that have no imaginary (non-acoustic-"
+                        "Gamma) mode on --fe_mesh, instead of the last "
+                        "iteration. F(T) is not guaranteed to decrease "
+                        "monotonically between iterations (stochastic "
+                        "sampling noise), so this avoids training the "
+                        "higher-order fit on a worse-than-best snapshot "
+                        "just because it ran last -- and the stability "
+                        "filter avoids locking onto an unstable model that "
+                        "merely has a low harmonic free energy. Raises if "
+                        "no iteration is stable. Ignored with "
+                        "--skip_scph/--fc2_only.")
+    p.add_argument("--stability_tol", type=float, default=-0.01,
+                   help="With --select_best_iteration: a mesh frequency "
+                        "(THz) below this (negative) tolerance marks an "
+                        "iteration as imaginary/unstable. Slightly negative "
+                        "by default to tolerate numerical/symmetrization "
+                        "noise in near-zero soft optical modes.")
     p.add_argument("--fe_mesh", default="10 10 10",
                    help="q-point mesh for the per-iteration free energy "
                         "calc used by --select_best_iteration (lighter than "

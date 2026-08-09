@@ -136,49 +136,26 @@ run being inspected. Outputs land in `output/T{T}/`.
 
 ## `plot_coherence_regime.py`
 
-If `--transport_type` (SMM19/NJC23/IBDB19) gives substantially different
-kappa_inter, this diagnoses why from an existing `kappa-m*.hdf5` -- no new
-BTE run needed, since gamma/frequency don't depend on transport_type.
-NJC23 and IBDB19 share the same resonance kernel and differ only in a
-heat-capacity-matrix prefactor that agrees when two bands' frequencies are
-close and diverges the more mismatched they are; this only matters where
-the kernel itself is non-negligible, i.e. where linewidth broadening is
-comparable to the frequency gap between bands.
+Diagnoses why `--transport_type` (SMM19/NJC23/IBDB19) gives substantially
+different `kappa_inter`, from an existing `kappa-m*.hdf5` -- no new BTE run
+needed.
 
 ```bash
 python plot_coherence_regime.py --kappa_hdf5 results/kappa-m191919.hdf5 --temperature 300
 ```
 
-Writes a `g` (summed linewidth) vs `|dw|` (frequency gap) scatter showing
-how much of the material's band pairs sit in that ambiguous regime, the
-analytic NJC23/IBDB19 prefactor-ratio curve with the material's own band
-pairs overlaid, and a `omega_i` vs `omega_j` heatmap colored by
-`<C_NJC23 - C_IBDB19>` averaged over q (only needs `frequency`, already in
-the file -- no gamma or velocities needed, since both formulas share the
-same `-1/T * (n_i-n_j)/(w_i-w_j)` factor and differ only in a prefactor).
-The heatmap has a phonon-DOS panel on top, so a gray region (no band pairs
-at that (omega_i, omega_j)) can be told apart from a real spectral gap
-(e.g. isolated X-H stretch modes far above a MOF's framework spectrum,
-common in light-atom organic frameworks) rather than just binning sparsity.
-Bins with mean `C_NJC23 - C_IBDB19` above `--annotate_threshold` (default
-`1e-3` eV/K) are labeled with `(omega_i, omega_j)` and the value; pass a
-negative number to disable. `--cutoff_frequency` (default `1e-2` THz,
-matching the native `phono3py` CLI's own default, not the bare `Phono3py()`
-class default of `1e-4`) excludes pairs involving a mode at/below it --
-without this, the ever-present Gamma-acoustic mode would show up here as a
-huge but fictitious divergence, since `C_NJC23`'s prefactor doesn't vanish
-as `omega -> 0` the way `C_IBDB19`'s does (see `thermal_transport_agent.py`'s
-`--cutoff_frequency` note above for the full mechanism).
+Writes a linewidth-vs-frequency-gap scatter, the NJC23/IBDB19
+prefactor-ratio curve, and a heatmap of where the two formulations disagree
+most, with a phonon-DOS panel for context. `--annotate_threshold` (default
+`1e-3` eV/K) labels the biggest-disagreement bins; negative disables it.
+`--cutoff_frequency` (default `1e-2` THz) excludes near-zero modes, same as
+`thermal_transport_agent.py`.
 
 ## `plot_cumulative_kappa_inter.py`
 
-Pinpoints exactly which band-pair frequency gaps each `--transport_type`'s
-`kappa_inter` comes from, by recomputing phono3py's per-band-pair
-`mode_kappa_matrix` (not saved to `kappa-m*.hdf5`, unlike `gamma`/
-`frequency`) for SMM19, NJC23, and IBDB19 side by side. Reuses cached gamma
-(`read_gamma=True`) so no new phonon-phonon scattering is computed, but it
-does need the full `thermal_transport_agent.py` environment (phono3py,
-FC2/FC3 on disk), unlike `plot_coherence_regime.py`.
+Shows which band-pair frequency gaps each `--transport_type`'s
+`kappa_inter` comes from. Reuses cached gamma, so no new phonon-phonon
+scattering is computed, but needs FC2/FC3 on disk (phono3py environment).
 
 ```bash
 python plot_cumulative_kappa_inter.py \
@@ -186,16 +163,6 @@ python plot_cumulative_kappa_inter.py \
     --supercell "2 2 2" --mesh "19 19 19" --temperature 300 --solver rta
 ```
 
-Prints a sanity check per transport_type (summing the recomputed per-pair
-contributions must reproduce the already-known `kappa_inter` scalar almost
-exactly) and writes `kappa_inter_vs_dw_T{T}.png`: cumulative `kappa_inter`
-vs. frequency-gap cutoff, one line per formulation, showing exactly where
-in frequency-gap space they start to diverge.
-
-`--temperature` selects which single temperature to analyze, but
-`read_gamma=True` requires requesting the *entire* set of temperatures
-already stored in the cached gamma file (it can't select a subset on
-read) -- the script auto-detects that full set from `kappa-m{tag}.hdf5`
-(or the per-q `kappa-m{tag}-g*.hdf5` files) and picks out `--temperature`'s
-slice afterward, so you don't need to pass every original temperature
-yourself.
+Writes `kappa_inter_vs_dw_T{T}.png`: cumulative `kappa_inter` vs.
+frequency-gap cutoff, one line per formulation. `--temperature` picks one
+temperature out of the cached gamma file automatically.
