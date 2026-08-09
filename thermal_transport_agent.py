@@ -596,14 +596,21 @@ def stage_generate(
 # Stage 4: Forces
 # =============================================================================
 
+_worker_calc = None   # built once per process by _init_force_worker
+
+
+def _init_force_worker(cfg_dict: dict) -> None:
+    """Pool(initializer=...): build the calculator once per worker process."""
+    global _worker_calc
+    _worker_calc = make_calc(Config(**cfg_dict))
+
+
 def _force_worker(args: tuple) -> tuple[int, np.ndarray | None]:
-    idx, sc, cfg_dict = args
+    idx, sc = args
     if sc is None:
         return idx, None
-    cfg   = Config(**cfg_dict)
-    calc  = make_calc(cfg)
     atoms = phonopy_to_ase(sc)
-    atoms.calc = calc
+    atoms.calc = _worker_calc
     try:
         return idx, atoms.get_forces()
     except Exception as e:
@@ -650,7 +657,7 @@ def stage_forces(
         if p.exists() and cfg.resume:
             cached[i] = np.load(str(p))
         else:
-            to_compute.append((i, sc, asdict(cfg)))
+            to_compute.append((i, sc))
 
     log.info(f"  Cached: {len(cached)}  To compute: {len(to_compute)}"
              f"  Workers: {cfg.n_workers}")
@@ -659,9 +666,14 @@ def stage_forces(
         t0 = time.time()
         if cfg.n_workers > 1:
             from multiprocessing import Pool
-            with Pool(cfg.n_workers) as pool:
+            with Pool(
+                cfg.n_workers,
+                initializer=_init_force_worker,
+                initargs=(asdict(cfg),),
+            ) as pool:
                 results = pool.map(_force_worker, to_compute)
         else:
+            _init_force_worker(asdict(cfg))
             results = []
             for k, arg in enumerate(to_compute):
                 results.append(_force_worker(arg))
