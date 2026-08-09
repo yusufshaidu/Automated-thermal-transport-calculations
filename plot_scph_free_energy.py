@@ -150,6 +150,9 @@ def main() -> None:
                    help="Supercell dimensions (must match the SCPH run)")
     p.add_argument("-pa", "--primitive_matrix", default="auto",
                    help="Primitive matrix (must match the SCPH run)")
+    p.add_argument("-tolerance", "--symprec", type=float, default=1e-3,
+                   help="Symmetry precision -- must match the -tolerance/"
+                        "--symprec used for the SCPH run being inspected")
     p.add_argument("-o", "--outdir", required=True,
                    help="Output directory passed to generate_scph_fc2_fc3_agent.py (-o/--outdir)")
     p.add_argument("-temps", "--temperatures", required=True,
@@ -167,7 +170,7 @@ def main() -> None:
     temperatures     = [float(x) for x in args.temperatures.split()]
 
     _, supercell, _, phonon = phonopysupercell(
-        args.prim_file, sdim, primitive_matrix
+        args.prim_file, sdim, primitive_matrix, args.symprec
     )
 
     results: dict = {}

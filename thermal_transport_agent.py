@@ -110,6 +110,18 @@ class Config:
     symprec:           float = 1e-5
     amplitude:         float = 0.03
     cutoff_pair:       float = 5.0
+    # Modes at/below this frequency (THz) are excluded from BTE/coherence
+    # sums. 1e-2 matches the native `phono3py` CLI's own default (set
+    # explicitly in cui/phono3py_script.py) -- NOT the bare Phono3py()
+    # class's own internal default of 1e-4, which is what this and every
+    # other script here would silently fall back to if unset, since they
+    # all build Phono3py objects via the Python API rather than the CLI.
+    # A finite-displacement FC2's Gamma acoustic modes are usually
+    # symmetrized far below either threshold; a hiphive-fit SCPH FC2 may
+    # leave a larger (still spurious) residual that slips above 1e-4 but
+    # not 1e-2, letting a near-zero mode contaminate coherence formulas
+    # that don't vanish as omega -> 0 (e.g. NJC23). Raise further if so.
+    cutoff_frequency:  float = 1e-2
 
     # BTE
     solver:            str   = "rta"
@@ -532,6 +544,7 @@ def stage_generate(
         supercell_matrix = cfg.supercell_matrix,
         primitive_matrix = cfg.primitive_matrix_parsed,
         symprec          = cfg.symprec,
+        cutoff_frequency = cfg.cutoff_frequency,
         log_level        = 1,
         **_ph3_lang(),   # v4: lang="C" restores v3 per-q performance
     )
@@ -750,6 +763,7 @@ def load_ph3_from_disk(out_dir: Path, cfg: Config) -> Phono3py:
             supercell_matrix = ph3yml.supercell_matrix,
             primitive_matrix = ph3yml.primitive_matrix,
             symprec          = cfg.symprec,
+            cutoff_frequency = cfg.cutoff_frequency,
             log_level        = 1,
             **_ph3_lang(),   # v4: lang="C" restores v3 per-q performance
         )
@@ -779,6 +793,7 @@ def load_ph3_from_disk(out_dir: Path, cfg: Config) -> Phono3py:
             supercell_matrix = cfg.supercell_matrix,
             primitive_matrix = cfg.primitive_matrix_parsed,
             symprec          = cfg.symprec,
+            cutoff_frequency = cfg.cutoff_frequency,
             log_level        = 1,
             **_ph3_lang(),   # v4: lang="C" restores v3 per-q performance
         )
@@ -949,6 +964,25 @@ def _sync_gp_progress(
     return merged
 
 
+def _gamma_fingerprint(cfg: Config) -> dict:
+    """Settings that change the computed phonon lifetimes (gamma) itself.
+
+    transport_type is deliberately excluded: it only selects how kappa is
+    assembled from already-computed gamma + harmonic quantities (group
+    velocities, frequencies) — it does not change the three-phonon
+    scattering (gamma) computation, which is the expensive part of a BTE
+    run. See _kappa_config_fingerprint() for the full fingerprint that
+    additionally includes transport_type.
+    """
+    return {
+        "mesh":            cfg.mesh_list,
+        "solver":          cfg.solver,
+        "isotope":         cfg.isotope,
+        "mass_variances":  cfg.mass_variances_parsed,
+        "temperatures":    cfg.temperature_list,
+    }
+
+
 def _kappa_config_fingerprint(cfg: Config) -> dict:
     """Physics-relevant settings baked into kappa-m*-g*.hdf5 / kappa-m*.hdf5.
 
@@ -956,40 +990,96 @@ def _kappa_config_fingerprint(cfg: Config) -> dict:
     not change the numbers written to these files, so it is deliberately
     excluded.
     """
-    return {
-        "mesh":            cfg.mesh_list,
-        "solver":          cfg.solver,
-        "transport_type":  cfg.transport_type,
-        "isotope":         cfg.isotope,
-        "mass_variances":  cfg.mass_variances_parsed,
-        "temperatures":    cfg.temperature_list,
-    }
+    return {**_gamma_fingerprint(cfg), "transport_type": cfg.transport_type}
 
 
-def _invalidate_stale_kappa_cache(
+def _recompute_kappa_from_gamma(
+    ph3:     Phono3py,
     cfg:     Config,
     ckpt:    Checkpoint,
     log:     logging.Logger,
     out_dir: Path,
-) -> None:
+) -> dict:
     """
-    Move aside kappa result files if they were computed under different
-    BTE settings than the current run.
+    Rebuild kappa (+ kappa_summary.json) from already-computed gamma via
+    phono3py's own read_gamma=True, which transparently reads from
+    kappa-m{tag}.hdf5 if present, else falls back to the per-q
+    kappa-m{tag}-g*.hdf5 files. No new phonon-phonon scattering is
+    computed — this is the cheap path for a transport_type-only change,
+    and also the normal "assemble final kappa" step after serial_gp/
+    grid_points finishes. Updates checkpoint.json's kappa_config + collect
+    markers, since both call sites need that done consistently.
+    """
+    mesh, temps    = cfg.mesh_list, cfg.temperature_list
+    is_lbte, ctype = _resolve_bte(cfg)
+
+    ph3.mesh_numbers = mesh
+    _init_phph(ph3, log)
+
+    orig_cwd = os.getcwd()
+    os.chdir(str(out_dir))
+    try:
+        ph3.run_thermal_conductivity(
+            temperatures   = temps,
+            is_LBTE        = is_lbte,
+            transport_type = ctype,
+            is_isotope     = cfg.isotope,
+            mass_variances = cfg.mass_variances_parsed,
+            read_gamma     = True,
+            write_kappa    = True,
+        )
+    finally:
+        os.chdir(orig_cwd)
+
+    results = _extract_results(
+        ph3.thermal_conductivity, temps, mesh, log,
+        solver=cfg.solver, transport_type=cfg.transport_type,
+    )
+    summary = out_dir / "kappa_summary.json"
+    summary.write_text(json.dumps(results, indent=2))
+    log.info(f"  Saved: {summary}")
+
+    ckpt.set("kappa_config", _kappa_config_fingerprint(cfg))
+    ckpt.mark("collect", {"summary": str(summary)})
+    return results
+
+
+def _check_kappa_cache(
+    cfg:     Config,
+    ckpt:    Checkpoint,
+    log:     logging.Logger,
+    out_dir: Path,
+) -> str:
+    """
+    Reconcile cached kappa/gamma results against the current BTE settings.
+    Cheap: only compares small JSON fingerprints and renames files; never
+    touches phono3py or reads FC2/FC3.
+
+    Returns "full_invalidate" (gamma itself is stale — old kappa/gamma
+    files moved aside, a real recompute is needed), "cheap_recompute"
+    (only transport_type changed — caller should call
+    _recompute_kappa_from_gamma to reuse cached gamma), or "unchanged".
 
     --resume (default True) otherwise trusts any kappa-m{mesh}-g*.hdf5 /
     kappa-m{mesh}.hdf5 / kappa_summary.json file found on disk purely by
     filename, regardless of which solver/isotope/mass_variances/
     temperatures settings produced it. Toggling --isotope (or solver,
-    transport_type, mass_variances, temperatures) while pointing at an
-    out_dir that already has cached results for the same mesh therefore
-    silently returns the *old* result instead of recomputing — this is
-    the cause of "the --isotope flag doesn't seem to do anything".
-    """
-    tag     = cfg.mesh_tag
-    current = _kappa_config_fingerprint(cfg)
-    previous = ckpt.get("kappa_config")
+    mass_variances, temperatures) while pointing at an out_dir that already
+    has cached results for the same mesh would otherwise silently return
+    the *old* result instead of recomputing — this is the cause of "the
+    --isotope flag doesn't seem to do anything".
 
-    if previous is not None and previous != current:
+    transport_type is handled separately (see _gamma_fingerprint): it does
+    not affect gamma, so changing it alone reuses the cached gamma and only
+    redoes the cheap kappa-assembly step -- unless this is a single
+    grid-point job (cfg.gp_list is not None), which only ever writes a
+    partial gamma file and has nothing to assemble kappa from yet.
+    """
+    tag = cfg.mesh_tag
+    gamma_now, gamma_prev = _gamma_fingerprint(cfg), ckpt.get("gamma_config")
+    kappa_now, kappa_prev = _kappa_config_fingerprint(cfg), ckpt.get("kappa_config")
+
+    if gamma_prev is not None and gamma_prev != gamma_now:
         stale_dir = out_dir / f"_stale_kappa_{int(time.time())}"
         stale_dir.mkdir(exist_ok=True)
         moved = []
@@ -1004,14 +1094,34 @@ def _invalidate_stale_kappa_cache(
 
         log.warning(
             "  [CACHE INVALIDATED] BTE settings changed since the cached "
-            "results in this out_dir were computed:\n"
-            f"    previous : {previous}\n"
-            f"    current  : {current}\n"
+            "gamma in this out_dir was computed:\n"
+            f"    previous : {gamma_prev}\n"
+            f"    current  : {gamma_now}\n"
             f"  Moved {len(moved)} stale file(s) to {stale_dir.name}/ "
             "— recomputing from scratch."
         )
+        ckpt.set("gamma_config", gamma_now)
+        ckpt.set("kappa_config", kappa_now)
+        return "full_invalidate"
 
-    ckpt.set("kappa_config", current)
+    ckpt.set("gamma_config", gamma_now)
+
+    has_cached_gamma = (out_dir / f"kappa-m{tag}.hdf5").exists() or \
+                        any(out_dir.glob(f"kappa-m{tag}-g*.hdf5"))
+    if (kappa_prev is not None and kappa_prev != kappa_now
+            and cfg.gp_list is None and has_cached_gamma):
+        log.warning(
+            "  [TRANSPORT_TYPE CHANGED] mesh/solver/isotope/mass_variances/"
+            "temperatures unchanged — reusing cached phonon lifetimes "
+            "(gamma), recomputing kappa only (no new phonon-phonon "
+            "scattering computed):\n"
+            f"    previous : {kappa_prev}\n"
+            f"    current  : {kappa_now}"
+        )
+        return "cheap_recompute"
+
+    ckpt.set("kappa_config", kappa_now)
+    return "unchanged"
 
 
 # =============================================================================
@@ -1481,7 +1591,11 @@ def stage_kappa(
     # Must run before _sync_gp_progress, which otherwise treats any
     # kappa-m{mesh}-g*.hdf5 file on disk as valid regardless of the
     # solver/isotope/mass_variances/temperatures settings that produced it.
-    _invalidate_stale_kappa_cache(cfg, ckpt, log, out_dir)
+    # A transport_type-only change is handled as a cheap recompute here
+    # (reuses cached gamma) and returned directly, skipping the BTE stage.
+    cache_state = _check_kappa_cache(cfg, ckpt, log, out_dir)
+    if cache_state == "cheap_recompute":
+        return _recompute_kappa_from_gamma(ph3, cfg, ckpt, log, out_dir)
 
     # ── Always sync disk -> checkpoint before anything else ────────────────
     # Runs for ALL parallel modes. Scans kappa-m*-g*.hdf5 files on disk,
@@ -1537,86 +1651,38 @@ def stage_collect(
     log.info(f"STAGE 7  Collect  [{_solver_label(cfg)}]")
     log.info("─" * 60)
 
+    tag     = cfg.mesh_tag
+    summary = out_dir / "kappa_summary.json"
+
     # Idempotent: no-op if stage_kappa already ran with this config in this
     # process. Needed here too because `run_collect` can call stage_collect
-    # directly without going through stage_kappa first.
-    _invalidate_stale_kappa_cache(cfg, ckpt, log, out_dir)
+    # directly without going through stage_kappa first. Also handles a
+    # transport_type-only change (cheap recompute from cached gamma). Cheap
+    # by itself — only builds ph3 (which reads FC2/FC3 from disk) if we
+    # actually need it below, not for the fast "just load cached JSON" case.
+    cache_state = _check_kappa_cache(cfg, ckpt, log, out_dir)
 
-    tag         = cfg.mesh_tag
-    mesh        = cfg.mesh_list
-    temps       = cfg.temperature_list
-    final_kappa = out_dir / f"kappa-m{tag}.hdf5"
-    summary     = out_dir / "kappa_summary.json"
-
-    # ── Resume level 1: summary JSON already written ──────────────────────
-    if ckpt.done("collect") and summary.exists():
+    if cache_state == "unchanged" and ckpt.done("collect") and summary.exists():
         log.info("  [RESUME] kappa_summary.json exists — loading directly")
         return json.loads(summary.read_text())
 
-    # ── Resume level 2: final kappa HDF5 exists but summary missing ───────
-    if ckpt.done("collect") and final_kappa.exists():
-        log.info("  [RESUME] Final kappa HDF5 exists — re-extracting results")
-        is_lbte, ctype = _resolve_bte(cfg)
-        ph3 = load_ph3_from_disk(out_dir, cfg)
-        ph3.mesh_numbers = mesh
-        _init_phph(ph3, log)
-        orig_cwd = os.getcwd()
-        os.chdir(str(out_dir))
-        try:
-            ph3.run_thermal_conductivity(
-                temperatures   = temps,
-                is_LBTE        = is_lbte,
-                transport_type = ctype,
-                is_isotope     = cfg.isotope,
-                mass_variances = cfg.mass_variances_parsed,
-                read_gamma     = True,
-                write_kappa    = True,
-            )
-        finally:
-            os.chdir(orig_cwd)
-        results = _extract_results(
-            ph3.thermal_conductivity, temps, mesh, log,
-            solver=cfg.solver, transport_type=cfg.transport_type,
-        )
-        summary.write_text(json.dumps(results, indent=2))
-        ckpt.mark("collect", {"summary": str(summary)})
-        return results
+    ph3 = load_ph3_from_disk(out_dir, cfg)
 
-    # ── Normal: assemble from per-q files ────────────────────────────────
-    gp_files = sorted(out_dir.glob(f"kappa-m{tag}-g*.hdf5"))
-    log.info(f"  Found {len(gp_files)} kappa-m{tag}-g*.hdf5 files")
-    if not gp_files:
+    if cache_state == "cheap_recompute":
+        return _recompute_kappa_from_gamma(ph3, cfg, ckpt, log, out_dir)
+
+    # ── Assemble from per-q files (or the final kappa file, if present) ───
+    gp_files    = sorted(out_dir.glob(f"kappa-m{tag}-g*.hdf5"))
+    final_kappa = out_dir / f"kappa-m{tag}.hdf5"
+    if not gp_files and not final_kappa.exists():
         raise FileNotFoundError(
-            f"No kappa-m{tag}-g*.hdf5 files in {out_dir}.\n"
+            f"No kappa-m{tag}-g*.hdf5 or kappa-m{tag}.hdf5 files in {out_dir}.\n"
             "Run the BTE step (serial_gp / grid_points) first."
         )
+    log.info(f"  Found {len(gp_files)} kappa-m{tag}-g*.hdf5 file(s)"
+             + ("" if gp_files else f", using {final_kappa.name}"))
 
-    is_lbte, ctype = _resolve_bte(cfg)
-    ph3 = load_ph3_from_disk(out_dir, cfg)
-    ph3.mesh_numbers = mesh
-    _init_phph(ph3, log)
-
-    orig_cwd = os.getcwd()
-    os.chdir(str(out_dir))
-    try:
-        ph3.run_thermal_conductivity(
-            temperatures   = temps,
-            is_LBTE        = is_lbte,
-            transport_type = ctype,
-            read_gamma     = True,
-            write_kappa    = True,
-        )
-    finally:
-        os.chdir(orig_cwd)
-
-    results = _extract_results(
-        ph3.thermal_conductivity, temps, mesh, log,
-        solver=cfg.solver, transport_type=cfg.transport_type,
-    )
-    summary.write_text(json.dumps(results, indent=2))
-    log.info(f"  Saved: {summary}")
-    ckpt.mark("collect", {"summary": str(summary)})
-    return results
+    return _recompute_kappa_from_gamma(ph3, cfg, ckpt, log, out_dir)
 
 
 # =============================================================================
@@ -1862,6 +1928,16 @@ def _add_bte_args(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument("--symprec",      type=float, default=1e-5)
+    p.add_argument("--cutoff_frequency", type=float, default=1e-2,
+                   help="Modes at/below this frequency (THz) are excluded "
+                        "from BTE/coherence sums -- matches the native "
+                        "phono3py CLI's own default (NOT the bare Phono3py() "
+                        "class default of 1e-4 that this script would "
+                        "otherwise silently fall back to). Raise further if "
+                        "FC2/FC3 from a fitted source (e.g. SCPH) leaves a "
+                        "spurious near-zero Gamma-acoustic residual above "
+                        "this that contaminates coherence formulas not "
+                        "vanishing as omega -> 0 (e.g. --transport_type NJC23).")
     p.add_argument("--out_dir",      default="results")
     p.add_argument("--resume",       action="store_true")
     p.add_argument(
@@ -1973,6 +2049,7 @@ def args_to_config(a: argparse.Namespace) -> Config:
         supercell        = getattr(a, "supercell",        "2 2 2"),
         primitive_matrix = getattr(a, "primitive_matrix", "auto"),
         symprec          = getattr(a, "symprec",          1e-5),
+        cutoff_frequency = getattr(a, "cutoff_frequency", 1e-2),
         amplitude        = getattr(a, "amplitude",        0.03),
         cutoff_pair      = getattr(a, "cutoff_pair",      5.0),
         mesh             = a.mesh,

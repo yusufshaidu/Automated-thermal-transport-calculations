@@ -105,12 +105,18 @@ class DisplacementMethod(Enum):
 # Structure / phonopy helpers
 # =============================================================================
 
-def phonopysupercell(prim_file: str, dim: np.ndarray, primitive_matrix):
+def phonopysupercell(prim_file: str, dim: np.ndarray, primitive_matrix, symprec: float = 1e-3):
     """
     Build a Phonopy object and matching ASE supercell from a structure file.
 
     Tries phonopy's own VASP reader first; falls back to ASE (which handles
     POSCAR, CIF, XYZ, etc.) if phonopy returns None.
+
+    symprec must match whatever tolerance is used elsewhere in the same run
+    (hiphive's ClusterSpace, and the downstream thermal_transport_agent.py
+    bte's --symprec) -- a mismatch means the FC2/FC3 fit's symmetry
+    assumptions can disagree with what gets used to symmetrize them or
+    reduce q-points over the Brillouin zone later.
     """
     from phonopy.structure.atoms import PhonopyAtoms as _PhonopyAtoms
 
@@ -138,7 +144,7 @@ def phonopysupercell(prim_file: str, dim: np.ndarray, primitive_matrix):
         unitcell,
         supercell_matrix = np.diag(dim),
         primitive_matrix = primitive_matrix,
-        symprec          = 0.001,
+        symprec          = symprec,
     )
     phonopy_sup = phonon.supercell
     supercell = Atoms(
@@ -468,6 +474,7 @@ def run_scph_and_collect(
     primitive_matrix,
     calc,
     n_collect:       int,             # collect configs from last n_collect iters
+    symprec:         float,
     qm_statistics:   bool,
     imag_freq_factor: float,
     ckpt_interval:   int,
@@ -557,7 +564,7 @@ def run_scph_and_collect(
               f"(SCPH iteration skipped) …")
         fcm.parameters = parameters_old
         fc2_ase = fcm.get_force_constants().get_fc_array(order=2, format="ase")
-        _, _, _, phonon = phonopysupercell(prim_file, sdim, primitive_matrix)
+        _, _, _, phonon = phonopysupercell(prim_file, sdim, primitive_matrix, symprec)
         phonon.force_constants = fc2_to_phonopy(fc2_ase, len(supercell))
         phonon.symmetrize_force_constants()
 
@@ -624,7 +631,7 @@ def run_scph_and_collect(
             it = int(m.group(1)) + 1
             if it >= nstart:
                 continue
-            _, _, _, phonon_prev = phonopysupercell(prim_file, sdim, primitive_matrix)
+            _, _, _, phonon_prev = phonopysupercell(prim_file, sdim, primitive_matrix, symprec)
             fc2_prev = ForceConstantPotential.read(f).get_force_constants(
                 supercell
             ).get_fc_array(order=2, format="phonopy")
@@ -645,7 +652,7 @@ def run_scph_and_collect(
         # FC2 from current parameters -> set on phonon
         fcm.parameters = parameters_old
         fc2_ase = fcm.get_force_constants().get_fc_array(order=2, format="ase")
-        _, _, _, phonon = phonopysupercell(prim_file, sdim, primitive_matrix)
+        _, _, _, phonon = phonopysupercell(prim_file, sdim, primitive_matrix, symprec)
         N = len(supercell)
         phonon.force_constants = fc2_to_phonopy(fc2_ase, N)
         phonon.symmetrize_force_constants()
@@ -925,7 +932,7 @@ def main(args):
 
     # ── Build supercell + 2nd order ClusterSpace ─────────────────────────
     _, supercell, _, phonon = phonopysupercell(
-        args.prim_file, sdim, primitive_matrix
+        args.prim_file, sdim, primitive_matrix, args.symprec
     )
     N = len(supercell)
     print(f"\n  Space group: {phonon.symmetry.get_international_table()}")
@@ -1034,6 +1041,7 @@ def main(args):
                 primitive_matrix = primitive_matrix,
                 calc             = calc,
                 n_collect        = args.n_collect,
+                symprec          = args.symprec,
                 qm_statistics    = args.qm_statistics,
                 imag_freq_factor = args.imag_freq_factor,
                 ckpt_interval    = args.ckpt,
@@ -1060,7 +1068,7 @@ def main(args):
 
         # ── Export force constants to phono3py HDF5 (+ generic for order>3)
         print("\n  Exporting force constants …")
-        _, _, _, phonon_T = phonopysupercell(args.prim_file, sdim, primitive_matrix)
+        _, _, _, phonon_T = phonopysupercell(args.prim_file, sdim, primitive_matrix, args.symprec)
         fc_all = export_to_phono3py(
             fcp_all, supercell, phonon_T, T_dir, max_order=max_order
         )
