@@ -122,6 +122,16 @@ class Config:
     # not 1e-2, letting a near-zero mode contaminate coherence formulas
     # that don't vanish as omega -> 0 (e.g. NJC23). Raise further if so.
     cutoff_frequency:  float = 1e-2
+    # load_ph3_from_disk() (used by bte/collect) re-symmetrizes FC2/FC3
+    # after loading by default: a finite-displacement FC3 already went
+    # through produce_fc3(symmetrize_fc3r=True) before being saved, so this
+    # is cheap/idempotent there, but a hiphive-fit SCPH FC2/FC3 is not
+    # guaranteed to satisfy phono3py's translational/permutation symmetry
+    # convention at all -- that's the real source of a Gamma-acoustic
+    # residual well above numerical noise (see cutoff_frequency above).
+    # FC3 symmetrization can be slow for large supercells; skip only that
+    # part if needed.
+    skip_fc_symmetrize: bool = False
 
     # BTE
     solver:            str   = "rta"
@@ -801,6 +811,20 @@ def load_ph3_from_disk(out_dir: Path, cfg: Config) -> Phono3py:
 
     ph3.fc2 = _read_fc2(fc2_path, ph3)
     ph3.fc3 = _read_fc3(fc3_path)
+
+    if not cfg.skip_fc_symmetrize:
+        # A finite-displacement FC3 already went through
+        # produce_fc3(symmetrize_fc3r=True) before being saved, so this is
+        # cheap/idempotent there. A hiphive-fit SCPH FC2/FC3 is not
+        # guaranteed to satisfy phono3py's translational/permutation
+        # symmetry convention at all -- an unsymmetrized FC2 is the real
+        # source of a Gamma-acoustic residual well above numerical noise,
+        # which can then leak past --cutoff_frequency into coherence sums.
+        t0 = time.time()
+        ph3.symmetrize_fc2()
+        ph3.symmetrize_fc3()
+        logging.info(f"  Symmetrized loaded FC2/FC3 ({time.time()-t0:.1f}s)")
+
     return ph3
 
 
@@ -1938,6 +1962,14 @@ def _add_bte_args(p: argparse.ArgumentParser) -> None:
                         "spurious near-zero Gamma-acoustic residual above "
                         "this that contaminates coherence formulas not "
                         "vanishing as omega -> 0 (e.g. --transport_type NJC23).")
+    p.add_argument("--skip_fc_symmetrize", action="store_true",
+                   help="bte/collect: don't re-symmetrize FC2/FC3 after "
+                        "loading them from disk (translational + permutation "
+                        "symmetry). On by default since a hiphive-fit SCPH "
+                        "FC2/FC3 isn't guaranteed to already satisfy this; "
+                        "skip only if FC3 symmetrization is too slow for a "
+                        "large supercell and you've verified it's already "
+                        "symmetric (e.g. finite-displacement FC3).")
     p.add_argument("--out_dir",      default="results")
     p.add_argument("--resume",       action="store_true")
     p.add_argument(
@@ -2050,6 +2082,7 @@ def args_to_config(a: argparse.Namespace) -> Config:
         primitive_matrix = getattr(a, "primitive_matrix", "auto"),
         symprec          = getattr(a, "symprec",          1e-5),
         cutoff_frequency = getattr(a, "cutoff_frequency", 1e-2),
+        skip_fc_symmetrize = getattr(a, "skip_fc_symmetrize", False),
         amplitude        = getattr(a, "amplitude",        0.03),
         cutoff_pair      = getattr(a, "cutoff_pair",      5.0),
         mesh             = a.mesh,

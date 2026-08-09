@@ -74,6 +74,20 @@ the same material run through the native `phono3py` CLI, this mismatched
 default is the first thing to suspect -- raise `--cutoff_frequency` further
 (e.g. to `0.05`-`0.1`) if the residual is larger still.
 
+Both the `bte` and `collect` subcommands also symmetrize a loaded FC2/FC3
+(`ph3.symmetrize_fc2()`/`symmetrize_fc3()`) right after reading them from
+disk, before anything else uses them. A finite-displacement FC3 already went
+through `produce_fc3(symmetrize_fc3r=True)` before being saved, so this is
+a cheap no-op there; a `generate_scph_fc2_fc3_agent.py` FC2/FC3 (fit via
+hiphive regression) is not guaranteed to satisfy phono3py's translational/
+permutation symmetry convention at all, and an unsymmetrized FC2 is the
+*real* source of the Gamma-acoustic residual discussed above, not just
+numerical noise -- on one real SCPH-fit MOF-274 FC2, symmetrizing dropped
+the Gamma-acoustic frequencies from ~0.0016-0.0026 THz to ~1e-6 THz.
+Pass `--skip_fc_symmetrize` to disable this (e.g. to reproduce old results,
+or if a non-hiphive FC2/FC3 source is already known to be exactly symmetric
+and the extra pass isn't worth its cost on a very large supercell).
+
 ## `generate_scph_fc2_fc3_agent.py`
 
 ```bash
