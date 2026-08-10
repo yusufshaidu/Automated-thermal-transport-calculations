@@ -1,20 +1,4 @@
-"""Diagnose why SMM19/NJC23/IBDB19 coherence kappa can diverge, from an existing kappa-m*.hdf5.
-
-No new phono3py run needed -- reads gamma (linewidths) and frequency,
-already saved by any past `thermal_transport_agent.py bte` run, regardless
-of which --transport_type produced the file.
-
-NJC23 and IBDB19 share the same Lorentzian resonance kernel
-    L(s,s') = g / (dw^2 + g^2),   g = gamma_s + gamma_s',  dw = omega_s - omega_s'
-and differ only in their heat-capacity-matrix prefactor: NJC23 uses
-(w_s+w_s')^2/4, IBDB19 uses w_s*w_s'. By AM-GM these agree when w_s ~ w_s'
-and diverge more the further apart the two frequencies are -- but that only
-matters for band pairs where L(s,s') is non-negligible, i.e. where the
-linewidth broadening g is comparable to the gap dw. This script plots that
-regime directly.
-
-python plot_coherence_regime.py --kappa_hdf5 results/kappa-m191919.hdf5 --temperature 300
-"""
+"""Diagnose why SMM19/NJC23/IBDB19 coherence kappa can diverge, from an existing kappa-m*.hdf5."""
 
 from __future__ import annotations
 
@@ -39,8 +23,7 @@ def load_gamma_frequency(kappa_hdf5: str, temperature: float):
 
 
 def pairwise_regime(gamma: np.ndarray, freq: np.ndarray, weight: np.ndarray):
-    """Off-diagonal (s != s') g, |dw|, freq ratio, resonance kernel L, and
-    BZ weight for every band pair at every q-point."""
+    """Compute off-diagonal g, |dw|, freq ratio, resonance kernel L, and BZ weight for every band pair."""
     n_gp, n_band = freq.shape
     iu, ju = np.triu_indices(n_band, k=1)   # unique unordered pairs, s < s'
 
@@ -92,9 +75,7 @@ def plot_regime_scatter(g_sum, dw, kernel, weight, T, out_png):
     fig.savefig(out_png, dpi=150)
     print(f"  wrote {out_png}")
 
-    # Fraction of total kernel weight sitting in the "ambiguous" regime
-    # (within a factor of 3 of g == |dw|), where NJC23 and IBDB19 disagree
-    # most and where a naive g>>dw or g<<dw argument doesn't decide things.
+    # Fraction of kernel weight in the "ambiguous" regime (g within 3x of |dw|), where NJC23/IBDB19 disagree most.
     ratio = g_sum / dw
     ambiguous = (ratio > 1 / 3) & (ratio < 3)
     total_w = np.sum(kernel * weight)
@@ -107,26 +88,7 @@ def plot_regime_scatter(g_sum, dw, kernel, weight, T, out_png):
 
 def pairwise_cqij(freq: np.ndarray, weight: np.ndarray, T: float,
                    cutoff_frequency: float = 1e-2):
-    """
-    Off-diagonal (s != s') omega_s, omega_s', and C_NJC23 - C_IBDB19 (the
-    heat-capacity-matrix entry each uses in the shared Lorentzian kernel),
-    for every band pair at every q-point. Needs only frequency + T -- no
-    gamma, no velocities -- since both formulas share the exact factor
-    -1/T * (n_s - n_s')/(w_s - w_s'), differing only in a prefactor
-    ((w_s+w_s')^2/4 for NJC23, w_s*w_s' for IBDB19). Mirrored across the
-    diagonal (both (i,j) and (j,i)) so the returned arrays plot symmetrically.
-
-    cutoff_frequency (THz) mirrors the native phono3py CLI's own default of
-    1e-2 (set explicitly in cui/phono3py_script.py -- NOT the bare
-    Phono3py() class's internal default of 1e-4): any pair where either
-    mode is at/below this is zeroed out entirely, matching
-    compute_bulk_cv_matrix()'s condition_2d masking in
-    conductivity/heat_capacity_solvers.py. Without this, a near-zero
-    Gamma-acoustic mode (always present, exactly 0 by symmetry) would show
-    up here as a huge but *fictitious* divergence: NJC23's prefactor
-    (w_i+w_j)^2/4 does not vanish as w_i -> 0, so this diagnostic would
-    otherwise report a difference phono3py's real calculation never sees.
-    """
+    """Compute off-diagonal omega_s, omega_s', and C_NJC23 - C_IBDB19 for every band pair, zeroing pairs at/below cutoff_frequency to avoid a fictitious Gamma-acoustic divergence."""
     KB, THZ_TO_EV = get_physical_units().KB, get_physical_units().THzToEv
 
     n_gp, n_band = freq.shape
@@ -136,11 +98,7 @@ def pairwise_cqij(freq: np.ndarray, weight: np.ndarray, T: float,
         with np.errstate(divide="ignore", over="ignore"):
             return 1.0 / (np.exp(e / (KB * T)) - 1.0)
 
-    # (n_i - n_j)/(e_i - e_j) is a removable 0/0 singularity as e_i -> e_j
-    # (both formulas' shared factor). Its analytic limit is dn/de evaluated
-    # at e = e_i, i.e. -n(n+1)/(KB*T) -- NOT zero, and in fact this is where
-    # the mode heat capacity is largest, so zeroing it would hide exactly
-    # the near-degenerate pairs that matter most for the coherence term.
+    # (n_i - n_j)/(e_i - e_j) is a removable 0/0 singularity as e_i -> e_j; use the analytic limit -n(n+1)/(KB*T) instead of zeroing it, since that's where the mode heat capacity is largest.
     eps = 1e-8   # eV; typical adjacent-mode gaps are >= 1e-4 eV (~0.02 THz)
 
     wi_list, wj_list, diff_list, w_list = [], [], [], []
@@ -178,17 +136,7 @@ def pairwise_cqij(freq: np.ndarray, weight: np.ndarray, T: float,
 
 def plot_cqij_heatmap(wi, wj, diff, weight, freq, gp_weight, T, out_png,
                        n_bins: int = 60, annotate_threshold: float | None = 1e-1):
-    """omega_s vs omega_s', colored by (C_NJC23 - C_IBDB19) averaged over q.
-
-    A gray cell means no band pair in the mesh has that (omega_i, omega_j)
-    combination -- which is ambiguous on its own: it could mean this exact
-    combination is rare, or it could mean one (or both) of those
-    frequencies simply doesn't exist anywhere in the phonon spectrum (a
-    real gap, common in MOFs where light-atom X-H stretches sit far above
-    the framework/lattice modes). The DOS panel on top disambiguates: if
-    it's flat zero over some range, any gray cell touching that range is a
-    genuine spectral gap, not a binning artifact.
-    """
+    """Plot omega_s vs omega_s' heatmap colored by (C_NJC23 - C_IBDB19) averaged over q, with a DOS panel to disambiguate gray (no-data) cells from real spectral gaps."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -200,13 +148,10 @@ def plot_cqij_heatmap(wi, wj, diff, weight, freq, gp_weight, T, out_png,
     sum_w,  _, _ = np.histogram2d(wi, wj, bins=bins, weights=weight)
     with np.errstate(divide="ignore", invalid="ignore"):
         avg = sum_wd / sum_w
-    # diff is provably >= 0 (NJC23's prefactor >= IBDB19's by AM-GM); clip
-    # away any roundoff-negative noise so 0 always means "equal", not "close to 0".
+    # diff is provably >= 0 (AM-GM); clip roundoff-negative noise so 0 always means "equal".
     avg = np.ma.masked_invalid(np.clip(avg, 0, None))
 
-    # White at 0 ("the formulas agree here"), saturating to dark red as the
-    # gap grows; masked (no band pairs in this bin) rendered as a visually
-    # distinct flat gray so it's never confused with a real zero-difference bin.
+    # White at 0 (formulas agree), dark red as the gap grows; masked bins (no data) rendered gray.
     cmap = matplotlib.colormaps["OrRd"].copy()
     cmap.set_bad(color="#bbbbbb")
 
@@ -231,26 +176,18 @@ def plot_cqij_heatmap(wi, wj, diff, weight, freq, gp_weight, T, out_png,
     ax.set_ylabel("omega_j  [THz]")
     ax.set_xlim(bins[0], bins[-1])
     ax.set_ylim(bins[0], bins[-1])
-    # No set_aspect("equal") here: it repads the axes box to keep a square
-    # aspect ratio, which throws off the horizontal alignment with the DOS
-    # panel above even though they nominally share an x-axis.
+    # No set_aspect("equal"): it would repad the axes box and break alignment with the DOS panel above.
     cbar = fig.colorbar(pc, ax=[ax_dos, ax], fraction=0.046, pad=0.02)
     cbar.set_label("mean C_NJC23 - C_IBDB19  [eV/K]  (q-averaged)")
 
     if annotate_threshold is not None:
         centers = (bins[:-1] + bins[1:]) / 2
         filled = ~avg.mask
-        # avg[m, n] <-> (omega_i bin m, omega_j bin n); only m < n so each
-        # physical pair (mirrored onto both (m,n) and (n,m)) is considered once.
+        # only m < n so each physical pair (mirrored onto (m,n) and (n,m)) is considered once
         candidates = [(m, n) for m, n in zip(*np.where(filled & (avg.data > annotate_threshold)))
                       if m < n]
 
-        # Greedy non-max suppression, highest value first: skip a candidate
-        # if it's within 1 bin of an already-accepted one. Deterministic
-        # (unlike a per-bin local-window check, which can accept ties on
-        # both sides of a plateau) and turns a broad contiguous region
-        # above threshold into one label at its peak instead of an
-        # unreadable stack of overlapping labels.
+        # Greedy non-max suppression, highest value first, so a contiguous region above threshold gets one label instead of an overlapping stack.
         candidates.sort(key=lambda mn: avg.data[mn], reverse=True)
         accepted: list[tuple[int, int]] = []
         for m, n in candidates:
@@ -275,9 +212,7 @@ def plot_cqij_heatmap(wi, wj, diff, weight, freq, gp_weight, T, out_png,
 
 
 def plot_prefactor_ratio(ratio, kernel, weight, out_png):
-    """Analytic NJC23/IBDB19 prefactor ratio vs frequency mismatch, with a
-    histogram of the material's own band pairs (weighted by resonance
-    kernel * BZ weight, i.e. how much each pair actually matters) overlaid."""
+    """Plot analytic NJC23/IBDB19 prefactor ratio vs frequency mismatch, with the material's band pairs histogrammed on top."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

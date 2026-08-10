@@ -1,17 +1,5 @@
 #!/usr/bin/env python
-"""thermal_transport_agent.py
-
-Automated lattice thermal conductivity pipeline: relax -> displaced
-supercells -> forces (MACE/UMA) -> FC2/FC3 (phono3py) -> BTE -> kappa(T).
-Subcommands: full, bte, collect. See `--help` for the parallel_mode summary
-and progress-monitoring snippet, and README.md for the full walkthrough.
-
-    python thermal_transport_agent.py full \\
-        --structure POSCAR --mace_model mace.model \\
-        --supercell "2 2 2" --cutoff_pair 5.0 --mesh "19 19 19" \\
-        --temperatures "300" --solver rta --transport_type SMM19 \\
-        --out_dir results/ --resume
-"""
+"""Automated lattice thermal conductivity pipeline: relax -> displaced supercells -> forces (MACE/UMA) -> FC2/FC3 (phono3py) -> BTE -> kappa(T)."""
 
 from __future__ import annotations
 
@@ -110,45 +98,21 @@ class Config:
     symprec:           float = 1e-5
     amplitude:         float = 0.03
     cutoff_pair:       float = 5.0
-    # Modes at/below this frequency (THz) are excluded from BTE/coherence
-    # sums. 1e-2 matches the native `phono3py` CLI's own default (set
-    # explicitly in cui/phono3py_script.py) -- NOT the bare Phono3py()
-    # class's own internal default of 1e-4, which is what this and every
-    # other script here would silently fall back to if unset, since they
-    # all build Phono3py objects via the Python API rather than the CLI.
-    # A finite-displacement FC2's Gamma acoustic modes are usually
-    # symmetrized far below either threshold; a hiphive-fit SCPH FC2 may
-    # leave a larger (still spurious) residual that slips above 1e-4 but
-    # not 1e-2, letting a near-zero mode contaminate coherence formulas
-    # that don't vanish as omega -> 0 (e.g. NJC23). Raise further if so.
+    # 1e-2 matches native phono3py CLI default, not bare Phono3py()'s 1e-4; raise if a hiphive-fit SCPH FC2 leaves a spurious near-zero mode.
     cutoff_frequency:  float = 1e-2
-    # load_ph3_from_disk() (used by bte/collect) re-symmetrizes FC2/FC3
-    # after loading by default: a finite-displacement FC3 already went
-    # through produce_fc3(symmetrize_fc3r=True) before being saved, so this
-    # is cheap/idempotent there, but a hiphive-fit SCPH FC2/FC3 is not
-    # guaranteed to satisfy phono3py's translational/permutation symmetry
-    # convention at all -- that's the real source of a Gamma-acoustic
-    # residual well above numerical noise (see cutoff_frequency above).
-    # FC3 symmetrization can be slow for large supercells; skip only that
-    # part if needed.
+    # A hiphive-fit SCPH FC2/FC3 isn't guaranteed to satisfy phono3py's symmetry convention; re-symmetrize by default, skip only for speed.
     skip_fc_symmetrize: bool = False
 
     # BTE
     solver:            str   = "rta"
-    # transport_type : None | "SMM19" | "NJC23" | "IBDB19"
-    #   None    -> standard particle-like transport (kappa_P only)
-    #   SMM19   -> Simoncelli-Marzari-Mauri (2019) Wigner transport equation
-    #   NJC23   -> alternative inter-band transport formulation
-    #   IBDB19  -> Isaeva-Barbalinardo-Donadio-Baroni (2019) formulation
+    # transport_type: None (kappa_P only) | "SMM19" | "NJC23" | "IBDB19" (inter-band transport formulations)
     transport_type:    str | None = None
     mesh:              str   = "11 11 11"
     temperatures:      str   = "300"
 
     # Isotope scattering
     isotope:           bool  = False
-    # mass_variances: space-separated per-atom-species g-factors, in the
-    # element order of the primitive cell. Empty -> phono3py's built-in
-    # natural-abundance values.
+    # mass_variances: space-separated per-species g-factors; empty -> phono3py's natural-abundance defaults.
     mass_variances:    str   = ""
 
     # Parallelism
@@ -209,40 +173,14 @@ class Config:
 # =============================================================================
 
 def _ph3_lang() -> dict:
-    """
-    Return the `lang` keyword for the Phono3py constructor.
-
-    phono3py v4 defaults to the Rust backend (phonors), which rebuilds
-    internal three-phonon interaction data on every run_thermal_conductivity
-    call and is significantly slower per q-point than the v3 C backend when
-    called in a loop from the Python API.
-
-    Using lang="C" restores the v3 C-extension behaviour, which preserves
-    interaction data across repeated calls and matches CLI-like per-q
-    performance.  For v3 installs, lang is not passed (the parameter did
-    not exist).
-    """
+    """Return the `lang` kwarg for the Phono3py constructor (lang="C" on v4 restores v3-speed per-q performance)."""
     if is_v4_or_later():
         return {"lang": "C"}
     return {}
 
 
 def _init_phph(ph3: Phono3py, log: logging.Logger | None = None) -> None:
-    """
-    Call ph3.init_phph_interaction() with the correct symmetrize_fc3q value
-    for the installed phono3py version.
-
-    phono3py v3.x: symmetrize_fc3q=True is cheap — apply it.
-    phono3py v4.x: symmetrize_fc3q=True triggers a full reciprocal-space
-        symmetrization via the Rust backend, which is very expensive for
-        large supercells (MOF-5: several minutes per call).  In v4 this
-        is redundant because:
-          (a) We already call produce_fc3(symmetrize_fc3r=True) which
-              applies real-space symmetry before writing the FC3.
-          (b) The v4 Rust backend applies its own internal symmetrization.
-        So we use symmetrize_fc3q=False for v4, matching the behaviour of
-        the v3 code path that ran without the extra q-space step.
-    """
+    """Call ph3.init_phph_interaction() with the correct symmetrize_fc3q value for the installed phono3py version."""
     use_sym = not is_v4_or_later()
     msg = (
         f"  init_phph_interaction(symmetrize_fc3q={use_sym}) "
@@ -269,17 +207,7 @@ def _init_phph(ph3: Phono3py, log: logging.Logger | None = None) -> None:
 # =============================================================================
 
 def _resolve_bte(cfg: Config) -> tuple[bool, str | None]:
-    """
-    Map (solver, transport_type) to (is_LBTE, transport_type) for the
-    current run_thermal_conductivity API.
-
-    solver  transport_type        ->  is_LBTE   transport_type passed through
-    ------  --------------------     -------   ------------------------------
-    rta     None                  ->  False     None       (kappa_P only)
-    rta     SMM19/NJC23/IBDB19    ->  False     same       (kappa_P + kappa_C, RTA)
-    lbte    None                  ->  True      None       (kappa_P, full BTE)
-    lbte    SMM19/NJC23/IBDB19    ->  True      same       (kappa_P + kappa_C, full BTE)
-    """
+    """Map (solver, transport_type) to (is_LBTE, transport_type) for run_thermal_conductivity."""
     is_lbte = cfg.solver.lower() == "lbte"
     return is_lbte, cfg.transport_type
 
@@ -424,12 +352,7 @@ def make_calc(cfg: Config):
 # =============================================================================
 
 def _read_fc2(fc2_path: Path, ph3: Phono3py) -> np.ndarray:
-    """
-    Read FC2 via phono3py's own reader.
-    p2s_map is intentionally omitted — phono3py detects compact vs full
-    automatically from the HDF5 content, consistent with how we write
-    (no p2s_map in write_fc2_to_hdf5).
-    """
+    """Read FC2 via phono3py's own reader."""
     from phono3py.file_IO import read_fc2_from_hdf5
     return read_fc2_from_hdf5(filename=str(fc2_path))
 
@@ -722,9 +645,7 @@ def stage_fc(
     fc2_path = out_dir / "fc2.hdf5"
     fc3_path = out_dir / "fc3.hdf5"
 
-    # produce_fc3 produces both FC2 and FC3 internally — no separate
-    # produce_fc2 call needed.  Both are checkpointed together since FC2
-    # alone is not useful without FC3 for thermal conductivity.
+    # produce_fc3 produces both FC2 and FC3 internally; checkpointed together.
     if (ckpt.done("fc3") and fc3_path.exists() and
             fc2_path.exists() and cfg.resume):
         log.info("  [RESUME] FC2 from fc2.hdf5")
@@ -751,21 +672,7 @@ def stage_fc(
 # =============================================================================
 
 def load_ph3_from_disk(out_dir: Path, cfg: Config) -> Phono3py:
-    """
-    Rebuild a Phono3py object from FC2/FC3 on disk.
-
-    Two code paths:
-
-    A) Standard phono3py pipeline  (phono3py_disp.yaml present)
-       Unit cell, supercell matrix, and primitive matrix are read from the
-       YAML.  Dataset is also restored (needed for some phono3py internals).
-
-    B) SCPH / hiphive pipeline  (no phono3py_disp.yaml)
-       The YAML is never written in this workflow.  Build Phono3py directly
-       from cfg.structure (POSCAR) + cfg.supercell_matrix + cfg.primitive_matrix.
-       Requires --structure, --supercell, and --primitive_matrix to be set
-       correctly on the CLI.
-    """
+    """Rebuild a Phono3py object from FC2/FC3 on disk (from phono3py_disp.yaml if present, else from --structure/--supercell for SCPH/hiphive)."""
     fc2_path  = out_dir / "fc2.hdf5"
     fc3_path  = out_dir / "fc3.hdf5"
     yaml_path = out_dir / "phono3py_disp.yaml"
@@ -826,13 +733,7 @@ def load_ph3_from_disk(out_dir: Path, cfg: Config) -> Phono3py:
     ph3.fc3 = _read_fc3(fc3_path)
 
     if not cfg.skip_fc_symmetrize:
-        # A finite-displacement FC3 already went through
-        # produce_fc3(symmetrize_fc3r=True) before being saved, so this is
-        # cheap/idempotent there. A hiphive-fit SCPH FC2/FC3 is not
-        # guaranteed to satisfy phono3py's translational/permutation
-        # symmetry convention at all -- an unsymmetrized FC2 is the real
-        # source of a Gamma-acoustic residual well above numerical noise,
-        # which can then leak past --cutoff_frequency into coherence sums.
+        # An unsymmetrized SCPH-fit FC2 can leave a Gamma-acoustic residual that leaks past --cutoff_frequency into coherence sums.
         t0 = time.time()
         ph3.symmetrize_fc2()
         ph3.symmetrize_fc3()
@@ -847,50 +748,14 @@ def load_ph3_from_disk(out_dir: Path, cfg: Config) -> Phono3py:
 
 def _get_ir_grid_points(ph3: Phono3py, mesh: list[int],
                         log: logging.Logger | None = None) -> np.ndarray:
-    """
-    Return irreducible q-point indices in phono3py's BZGrid numbering.
-
-    IMPORTANT: the caller MUST call ph3.mesh_numbers and
-    ph3.init_phph_interaction() before calling this function.
-    This function deliberately does NOT call init_phph_interaction —
-    doing so would run it twice, which is extremely expensive for large
-    systems (symmetrize_fc3q=True on a MOF-5 848-atom supercell takes
-    many minutes; doubling it causes the apparent hang).
-
-    Strategy (in order):
-      1. ph3.grid (BZGrid) public API via get_ir_grid_points_compat() —
-         pure grid/symmetry construction, no phonon-phonon interaction or
-         conductivity work involved. Cheap.
-         NOTE: BZGrid itself has no `ir_grid_points` attribute on phono3py
-         v4 (its grid module moved to phonopy.phonon.grid — see
-         phono3py_compat.py); the irreducible points must be computed via
-         get_ir_grid_points(bz_grid), which returns GR-grid indices, then
-         mapped to BZ-grid indices via bz_grid.grg2bzg (see
-         phono3py/cui/kaccum_script.py for the reference usage).
-         get_ir_grid_points_compat() picks the correct import path
-         (phonopy vs. phono3py) based on the installed version.
-      2. phono3py RTA conductivity object .grid_points — LAST RESORT ONLY.
-         Despite appearances, constructing this object (or touching its
-         attributes) has been observed to actually run the single-mode
-         RTA solve rather than just exposing grid indices — confirmed by
-         setting log_level>0 and watching it compute kappa at the dummy
-         300 K "irrelevant" temperature. It is NOT a cheap accessor on
-         this phono3py version and must not be tried first. Kept only as
-         a fallback for phono3py versions where Path 1 fails, with a loud
-         warning so the cost is visible rather than silently eaten every
-         call.
-      3. Raise — spglib fallback deliberately removed to prevent mismatches
-         (its regular-mesh indices differ from phono3py's BZGrid indices).
-    """
+    """Return irreducible q-point indices in phono3py's BZGrid numbering (caller must init_phph_interaction first)."""
     def _log(msg):
         if log is not None:
             log.info(msg)
         else:
             logging.info(msg)
 
-    # ── Path 1 (preferred): ph3.grid (BZGrid) public API ──────────────────
-    # Pure grid/symmetry construction — no init_phph_interaction, no
-    # triplet enumeration, no scattering rates, no kappa. Cheap.
+    # ── Path 1 (preferred): ph3.grid (BZGrid) public API — cheap, no init_phph_interaction needed ──
     bz_grid = ph3.grid
     if bz_grid is not None:
         try:
@@ -902,10 +767,7 @@ def _get_ir_grid_points(ph3: Phono3py, mesh: list[int],
         except Exception as e:
             _log(f"  ph3.grid (BZGrid) path failed: {e}")
 
-    # ── Path 2 (last resort — EXPENSIVE): RTA conductivity object ─────────
-    # Only reached if Path 1 fails. Confirmed to actually run RTA-style
-    # computation on this install rather than being a lightweight
-    # constructor, so this is a genuine fallback, not a preferred route.
+    # ── Path 2 (last resort — EXPENSIVE): constructing this has been observed to actually run part of the RTA solve, not just expose grid indices ──
     _log("  WARNING: falling back to constructing an RTA conductivity "
          "object just to read .grid_points — this has been observed to "
          "actually run part of the thermal conductivity solve (confirmed "
@@ -948,25 +810,8 @@ def _sync_gp_progress(
     ckpt:    Checkpoint,
     log:     logging.Logger,
 ) -> set[int]:
-    """
-    Reconcile completed q-points from disk files and checkpoint.json.
-
-    Strategy
-    --------
-    - Parse gp indices from kappa-m{tag}-g{N}.hdf5 filenames on disk.
-    - Load done_gps list from checkpoint.json.
-    - If a gp is in checkpoint but has no file -> file is source of truth,
-      remove from set (will be recomputed).
-    - If a gp has a file but is not in checkpoint -> add to set (crash recovery).
-    - Persist merged set back to checkpoint.json.
-
-    Returns
-    -------
-    set of integer grid-point indices that are genuinely complete.
-    """
-    # phono3py names per-q files as kappa-m{tag}-g{N}.hdf5
-    # For large systems it may split by band: kappa-m{tag}-g{N}-b{B}.hdf5
-    # The regex extracts the grid-point index N from either form.
+    """Reconcile completed q-points between disk files and checkpoint.json, returning the merged set (disk is source of truth)."""
+    # kappa-m{tag}-g{N}.hdf5, optionally split by band as -g{N}-b{B}.hdf5
     pattern  = re.compile(rf"kappa-m{re.escape(tag)}-g(\d+)(?:-b\d+)?\.hdf5")
     disk_gps = set()
     for f in out_dir.glob(f"kappa-m{tag}-g*.hdf5"):
@@ -1002,15 +847,7 @@ def _sync_gp_progress(
 
 
 def _gamma_fingerprint(cfg: Config) -> dict:
-    """Settings that change the computed phonon lifetimes (gamma) itself.
-
-    transport_type is deliberately excluded: it only selects how kappa is
-    assembled from already-computed gamma + harmonic quantities (group
-    velocities, frequencies) — it does not change the three-phonon
-    scattering (gamma) computation, which is the expensive part of a BTE
-    run. See _kappa_config_fingerprint() for the full fingerprint that
-    additionally includes transport_type.
-    """
+    """Settings that change the computed phonon lifetimes (gamma) itself; transport_type is deliberately excluded."""
     return {
         "mesh":            cfg.mesh_list,
         "solver":          cfg.solver,
@@ -1021,12 +858,7 @@ def _gamma_fingerprint(cfg: Config) -> dict:
 
 
 def _kappa_config_fingerprint(cfg: Config) -> dict:
-    """Physics-relevant settings baked into kappa-m*-g*.hdf5 / kappa-m*.hdf5.
-
-    Anything not listed here (parallel_mode, n_workers, resume, ...) does
-    not change the numbers written to these files, so it is deliberately
-    excluded.
-    """
+    """Physics-relevant settings baked into kappa-m*-g*.hdf5 / kappa-m*.hdf5."""
     return {**_gamma_fingerprint(cfg), "transport_type": cfg.transport_type}
 
 
@@ -1037,16 +869,7 @@ def _recompute_kappa_from_gamma(
     log:     logging.Logger,
     out_dir: Path,
 ) -> dict:
-    """
-    Rebuild kappa (+ kappa_summary.json) from already-computed gamma via
-    phono3py's own read_gamma=True, which transparently reads from
-    kappa-m{tag}.hdf5 if present, else falls back to the per-q
-    kappa-m{tag}-g*.hdf5 files. No new phonon-phonon scattering is
-    computed — this is the cheap path for a transport_type-only change,
-    and also the normal "assemble final kappa" step after serial_gp/
-    grid_points finishes. Updates checkpoint.json's kappa_config + collect
-    markers, since both call sites need that done consistently.
-    """
+    """Rebuild kappa (+ kappa_summary.json) from already-computed gamma via read_gamma=True, without recomputing scattering."""
     mesh, temps    = cfg.mesh_list, cfg.temperature_list
     is_lbte, ctype = _resolve_bte(cfg)
 
@@ -1087,31 +910,7 @@ def _check_kappa_cache(
     log:     logging.Logger,
     out_dir: Path,
 ) -> str:
-    """
-    Reconcile cached kappa/gamma results against the current BTE settings.
-    Cheap: only compares small JSON fingerprints and renames files; never
-    touches phono3py or reads FC2/FC3.
-
-    Returns "full_invalidate" (gamma itself is stale — old kappa/gamma
-    files moved aside, a real recompute is needed), "cheap_recompute"
-    (only transport_type changed — caller should call
-    _recompute_kappa_from_gamma to reuse cached gamma), or "unchanged".
-
-    --resume (default True) otherwise trusts any kappa-m{mesh}-g*.hdf5 /
-    kappa-m{mesh}.hdf5 / kappa_summary.json file found on disk purely by
-    filename, regardless of which solver/isotope/mass_variances/
-    temperatures settings produced it. Toggling --isotope (or solver,
-    mass_variances, temperatures) while pointing at an out_dir that already
-    has cached results for the same mesh would otherwise silently return
-    the *old* result instead of recomputing — this is the cause of "the
-    --isotope flag doesn't seem to do anything".
-
-    transport_type is handled separately (see _gamma_fingerprint): it does
-    not affect gamma, so changing it alone reuses the cached gamma and only
-    redoes the cheap kappa-assembly step -- unless this is a single
-    grid-point job (cfg.gp_list is not None), which only ever writes a
-    partial gamma file and has nothing to assemble kappa from yet.
-    """
+    """Reconcile cached kappa/gamma results against current BTE settings; returns "full_invalidate", "cheap_recompute", or "unchanged"."""
     tag = cfg.mesh_tag
     gamma_now, gamma_prev = _gamma_fingerprint(cfg), ckpt.get("gamma_config")
     kappa_now, kappa_prev = _kappa_config_fingerprint(cfg), ckpt.get("kappa_config")
@@ -1169,26 +968,7 @@ def _resolve_kappa_attrs(
     tc,
     has_coherence: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    """
-    Extract (kappa_total, kappa_intra, kappa_inter) from the thermal
-    conductivity object, tolerating different attribute names across
-    phono3py versions/transport_type formulations.
-
-    Current inter-band transport naming (SMM19/NJC23/IBDB19):
-        kappa        -> total
-        kappa_intra  -> intra-band (particle-like) contribution
-        kappa_inter  -> inter-band (coherence) contribution
-
-    Older Wigner-only naming (kept as fallback for older installs):
-        kappa_TOT_RTA -> total
-        kappa_P_RTA   -> particle-like (~ intra)
-        kappa_C_RTA   -> coherence (~ inter)
-
-    Returns
-    -------
-    (kappa_tot, kappa_intra, kappa_inter, attr_label)
-    attr_label : str describing which attribute set was used, for logging.
-    """
+    """Extract (kappa_total, kappa_intra, kappa_inter) from the thermal conductivity object across phono3py attribute-naming versions."""
     def first_attr(names):
         return next((n for n in names if hasattr(tc, n)), None)
 
@@ -1213,10 +993,7 @@ def _resolve_kappa_attrs(
                     f"intra={intra_attr} inter={inter_attr}")
 
         if intra_attr is not None and total_attr is not None:
-            # Older Wigner-style API: only total + particle-like (intra)
-            # attributes exist (e.g. kappa_TOT_RTA + kappa_P_RTA, no
-            # separate kappa_C_RTA). Derive inter by subtraction, exactly
-            # as the original kappa_C = kappa_tot - kappa_P logic did.
+            # Older Wigner-style API has no separate inter attribute; derive it by subtraction.
             kappa_tot   = np.array(getattr(tc, total_attr))
             kappa_intra = np.array(getattr(tc, intra_attr))
             kappa_inter = kappa_tot - kappa_intra
@@ -1257,10 +1034,7 @@ def _extract_results(
     )
     log.info(f"  kappa attrs  : {attr_label}")
 
-    # ── Normalise to shape (n_temps, 6) ──────────────────────────────────
-    # Phono3py may return (n_temps, 6), (n_temps, 1, 6), or (n_temps, 3, 3)
-    # depending on version and transport_type.  Squeeze out length-1 dims
-    # then convert a full 3x3 tensor to 6-component Voigt form if needed.
+    # Normalise to shape (n_temps, 6): phono3py may return (n_temps, 6), (n_temps, 1, 6), or (n_temps, 3, 3) depending on version.
     def _to_voigt(arr: np.ndarray) -> np.ndarray:
         a = np.squeeze(arr)               # remove length-1 axes
         if a.ndim == 1:                   # single temperature already squeezed
@@ -1385,26 +1159,8 @@ def _run_bte_serial_gp(
     log:     logging.Logger,
     out_dir: Path,
 ) -> dict:
-    """
-    Process every irreducible q-point independently and sequentially.
-
-    _sync_gp_progress() is called by stage_kappa() BEFORE this function,
-    so done_gps in checkpoint.json is already up-to-date when we arrive.
-    We simply read it here — no second disk scan needed.
-
-    After each q-point:
-      - done_gps  (sorted list) is written to checkpoint.json immediately.
-      - gp_progress (human-readable summary) is also updated.
-    When all q-points are done, calls stage_collect().
-    """
-    # ── Fast resume: already fully collected — skip grid/ph-ph setup ──────
-    # stage_collect() has its own cheap resume check (summary JSON exists +
-    # ckpt.done("collect")) that never touches ph3, but it only helps if we
-    # reach it before doing grid/ph-ph setup here. Otherwise every
-    # invocation — even ones with nothing left to compute — pays for
-    # _get_ir_grid_points()'s expensive RTA-object fallback (its own
-    # docstring notes this has been observed to actually run part of a
-    # real solve, multiple minutes on this system).
+    """Process every irreducible q-point independently and sequentially, checkpointing progress after each one."""
+    # Fast resume: check before grid/ph-ph setup, which pays for _get_ir_grid_points()'s expensive RTA-object fallback.
     summary = out_dir / "kappa_summary.json"
     if ckpt.done("collect") and summary.exists():
         log.info("  [RESUME] kappa_summary.json already complete — "
@@ -1415,9 +1171,7 @@ def _run_bte_serial_gp(
     tag            = cfg.mesh_tag
     is_lbte, ctype = _resolve_bte(cfg)
 
-    # ── Init ph-ph interaction (done ONCE here; _get_ir_grid_points ──────
-    # must NOT call it again or it runs twice — very expensive for large
-    # systems and the primary cause of the apparent hang after stage_fc).
+    # Init ph-ph interaction ONCE here; _get_ir_grid_points must not call it again or it runs (expensively) twice.
     ph3.mesh_numbers = mesh
     _init_phph(ph3, log)
 
@@ -1425,9 +1179,7 @@ def _run_bte_serial_gp(
     n_ir   = len(ir_pts)
     log.info(f"  Irreducible q-points : {n_ir}")
 
-    # ── Read done_gps already synced by stage_kappa ───────────────────────
-    # stage_kappa called _sync_gp_progress before dispatching here,
-    # so checkpoint.json already reflects disk reality.
+    # done_gps was already synced by stage_kappa's call to _sync_gp_progress.
     done_gps    = set(ckpt.get("done_gps", []))
     n_cached    = len(done_gps.intersection(set(ir_pts.tolist())))
     n_remaining = n_ir - n_cached
@@ -1564,9 +1316,7 @@ def _run_bte_grid_parallel(
 ) -> dict:
     from multiprocessing import Pool
 
-    # ── Fast resume: already fully collected — skip grid/ph-ph setup ──────
-    # See the matching guard in _run_bte_serial_gp for why this must run
-    # before _get_ir_grid_points().
+    # Fast resume: see matching guard in _run_bte_serial_gp — must run before _get_ir_grid_points().
     summary = out_dir / "kappa_summary.json"
     if ckpt.done("collect") and summary.exists():
         log.info("  [RESUME] kappa_summary.json already complete — "
@@ -1624,22 +1374,12 @@ def stage_kappa(
              f"[{_solver_label(cfg)}]")
     log.info("─" * 60)
 
-    # ── Invalidate cached results from a different BTE config ─────────────
-    # Must run before _sync_gp_progress, which otherwise treats any
-    # kappa-m{mesh}-g*.hdf5 file on disk as valid regardless of the
-    # solver/isotope/mass_variances/temperatures settings that produced it.
-    # A transport_type-only change is handled as a cheap recompute here
-    # (reuses cached gamma) and returned directly, skipping the BTE stage.
+    # Must run before _sync_gp_progress, which otherwise treats any kappa-m{mesh}-g*.hdf5 file on disk as valid regardless of settings.
     cache_state = _check_kappa_cache(cfg, ckpt, log, out_dir)
     if cache_state == "cheap_recompute":
         return _recompute_kappa_from_gamma(ph3, cfg, ckpt, log, out_dir)
 
-    # ── Always sync disk -> checkpoint before anything else ────────────────
-    # Runs for ALL parallel modes. Scans kappa-m*-g*.hdf5 files on disk,
-    # merges with done_gps in checkpoint.json, and persists the union back.
-    # This ensures backward compatibility: files written by a previous run,
-    # a different version, or the phono3py CLI are detected and recorded
-    # in checkpoint.json even if done_gps was previously empty or missing.
+    # Sync disk -> checkpoint for all parallel modes, so files from a prior run/version/CLI are recorded.
     done_gps = _sync_gp_progress(out_dir, cfg.mesh_tag, ckpt, log)
     if done_gps:
         log.info(f"  Checkpoint updated: {len(done_gps)} q-point(s) "
@@ -1691,12 +1431,7 @@ def stage_collect(
     tag     = cfg.mesh_tag
     summary = out_dir / "kappa_summary.json"
 
-    # Idempotent: no-op if stage_kappa already ran with this config in this
-    # process. Needed here too because `run_collect` can call stage_collect
-    # directly without going through stage_kappa first. Also handles a
-    # transport_type-only change (cheap recompute from cached gamma). Cheap
-    # by itself — only builds ph3 (which reads FC2/FC3 from disk) if we
-    # actually need it below, not for the fast "just load cached JSON" case.
+    # Idempotent; needed here too since run_collect can call stage_collect directly without going through stage_kappa first.
     cache_state = _check_kappa_cache(cfg, ckpt, log, out_dir)
 
     if cache_state == "unchanged" and ckpt.done("collect") and summary.exists():

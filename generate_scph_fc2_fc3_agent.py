@@ -1,17 +1,5 @@
 #!/usr/bin/env python
-"""generate_scph_fc2_fc3_agent.py
-
-Self-consistent phonon (SCPH) loop (harmonic FC2 only) followed by a joint
-many-body fit (FC2..FC{N+1}, from --cutoffs) to the accumulated thermal
-displacements, exported to phono3py HDF5. See README.md for the full
-restart/seed/skip-SCPH/select-best-iteration options.
-
-    python generate_scph_fc2_fc3_agent.py \\
-        -prim POSCAR-unitcell -sdim "2 2 2" \\
-        --model mace.model --head omat_pbe \\
-        -cutoffs "6.0 4.5" -temps "100 200 300" \\
-        -N 100 -niter 50 -o output/
-"""
+"""SCPH loop (FC2) + joint many-body fit (FC2..FC{N+1}), exported to phono3py HDF5. See README.md."""
 
 from __future__ import annotations
 
@@ -49,11 +37,7 @@ from enum import Enum
 # =============================================================================
 
 def setup_logging(out_dir: str, name: str) -> logging.Logger:
-    """File-only logger at out_dir/pipeline_scph.log, appended to (not
-    overwritten) across restarts/reruns. *name* must be unique per T (e.g.
-    f"scph_T{T:.0f}") since logging.getLogger() caches by name -- reusing a
-    name across different out_dir values would silently keep writing into
-    the first out_dir's file."""
+    """File-only logger at out_dir/pipeline_scph.log; *name* must be unique per T."""
     logger = logging.getLogger(name)
     if logger.handlers:
         return logger
@@ -77,16 +61,7 @@ def build_cluster_space_safe(
     cutoff_step:  float = 0.01,
     max_attempts: int   = 50,
 ):
-    """
-    Construct a hiphive ClusterSpace, automatically nudging the cutoff(s)
-    if hiphive complains that the maximum cutoff lands exactly on a
-    neighbor shell ("Maximum cutoff close to neighbor shell, change
-    cutoff"). Whichever cutoff(s) currently equal the max are bumped by
-    +cutoff_step and construction is retried, mirroring the manual
-    "increase by 0.01 until it works" workaround.
-
-    Returns (ClusterSpace, cutoffs_used).
-    """
+    """Build a hiphive ClusterSpace, retrying with a bumped cutoff if it lands exactly on a neighbor shell."""
     cutoffs = list(cutoffs)
     for attempt in range(1, max_attempts + 1):
         try:
@@ -129,18 +104,7 @@ class DisplacementMethod(Enum):
 # =============================================================================
 
 def phonopysupercell(prim_file: str, dim: np.ndarray, primitive_matrix, symprec: float = 1e-3):
-    """
-    Build a Phonopy object and matching ASE supercell from a structure file.
-
-    Tries phonopy's own VASP reader first; falls back to ASE (which handles
-    POSCAR, CIF, XYZ, etc.) if phonopy returns None.
-
-    symprec must match whatever tolerance is used elsewhere in the same run
-    (hiphive's ClusterSpace, and the downstream thermal_transport_agent.py
-    bte's --symprec) -- a mismatch means the FC2/FC3 fit's symmetry
-    assumptions can disagree with what gets used to symmetrize them or
-    reduce q-points over the Brillouin zone later.
-    """
+    """Build a Phonopy object and matching ASE supercell from a structure file (phonopy VASP reader, falling back to ASE)."""
     from phonopy.structure.atoms import PhonopyAtoms as _PhonopyAtoms
 
     # ── Try phonopy's native reader ───────────────────────────────────────
@@ -195,13 +159,7 @@ def parse_sdim(s: str) -> np.ndarray:
 
 
 def parse_cutoffs(s: str) -> list:
-    """
-    Parse a space- or comma-separated list of cluster cutoffs (Å).
-
-    The number of cutoffs determines the highest body order fitted:
-    one cutoff -> 2nd order only, two -> 2nd+3rd, three -> 2nd..4th, etc.
-    (N cutoffs fit orders 2..N+1, in the order given.)
-    """
+    """Parse a space- or comma-separated list of cluster cutoffs (Å); N cutoffs fit body orders 2..N+1."""
     for sep in (" ", ","):
         tokens = [t for t in s.split(sep) if t]
         if not tokens:
@@ -230,12 +188,7 @@ def generate_displaced_structures(
     imag_freq_factor: float = 1.0,
     random_seed: int = None,
 ) -> list:
-    """
-    Generate n_structures thermally displaced ASE Atoms from FC2.
-
-    DisplacementMethod.HIPHIVE -> hiphive phonon rattler (classical)
-    DisplacementMethod.PHONOPY -> phonopy quantum or classical
-    """
+    """Generate n_structures thermally displaced ASE Atoms from FC2, via hiphive (classical) or phonopy (quantum/classical)."""
     structures = []
 
     if method == DisplacementMethod.HIPHIVE:
@@ -285,10 +238,7 @@ def evaluate_forces(
     supercell:   Atoms,
     calc,
 ) -> list:
-    """
-    Evaluate forces with *calc* for each displaced structure and attach
-    'displacements' and 'forces' arrays in hiphive convention.
-    """
+    """Evaluate forces with *calc* for each displaced structure and attach 'displacements'/'forces' arrays."""
     pos0     = supercell.get_positions()
     result   = []
     t0       = time.time()
@@ -333,11 +283,7 @@ def fc2_to_ase(fc2_phonopy: np.ndarray) -> np.ndarray:
 # =============================================================================
 
 def load_fc2_hdf5(fc2_path: str, N: int) -> np.ndarray:
-    """
-    Read an existing fc2.hdf5 (phono3py/phonopy format, full supercell FC2).
-
-    Returns the array in phonopy convention, shape (N, N, 3, 3).
-    """
+    """Read an existing fc2.hdf5 (phono3py/phonopy format), returning it in phonopy convention (N, N, 3, 3)."""
     fc2_phonopy = read_fc2_from_hdf5(filename=fc2_path)
     if fc2_phonopy.shape[:2] != (N, N):
         raise ValueError(
@@ -353,11 +299,7 @@ def parameters_from_fc2(
     supercell:   Atoms,
     cs2:         ClusterSpace,
 ) -> np.ndarray:
-    """
-    Project an existing FC2 array onto the cs2 ClusterSpace basis via linear
-    least-squares (hiphive.utilities.extract_parameters). No structures,
-    forces, or MLIP evaluation needed.
-    """
+    """Project an existing FC2 array onto the cs2 ClusterSpace basis via linear least-squares."""
     fcs = ForceConstants.from_arrays(supercell, fc2_array=fc2_phonopy)
     return extract_parameters(fcs, cs2)
 
@@ -367,12 +309,7 @@ def parameters_from_fcp_checkpoint(
     supercell: Atoms,
     cs2:       ClusterSpace,
 ) -> np.ndarray:
-    """
-    Extract 2nd-order parameters from a saved SCPH checkpoint
-    (fcp_scph/scph_T{T}_iter{i}.fcp or ..._final.fcp) to restart an
-    interrupted run, by projecting its FC2 onto *cs2* -- the same
-    technique --init_fc2 uses for fc2.hdf5.
-    """
+    """Extract 2nd-order parameters from a saved SCPH checkpoint by projecting its FC2 onto *cs2*."""
     N = len(supercell)
     fcp = ForceConstantPotential.read(fcp_path)
     fc2 = fcp.get_force_constants(supercell).get_fc_array(order=2, format="phonopy")
@@ -391,10 +328,7 @@ def parameters_from_fcp_checkpoint(
 # =============================================================================
 
 def find_config_files(configs_dir: str, T: float) -> list:
-    """
-    Find config_T{T}_N*_iter*.extxyz files written by a previous
-    run_scph_and_collect call, sorted by iteration number (ascending).
-    """
+    """Find config_T{T}_N*_iter*.extxyz files, sorted by iteration number."""
     pattern = os.path.join(configs_dir, f"config_T{T:.0f}_N*_iter*.extxyz")
     files = glob.glob(pattern)
 
@@ -407,12 +341,7 @@ def find_config_files(configs_dir: str, T: float) -> list:
 
 
 def find_latest_scph_checkpoint(fcp_dir: str, T: float) -> tuple[int, str] | None:
-    """
-    Find the highest-iteration scph_T{T}_iter*.fcp checkpoint in *fcp_dir*
-    (used to auto-resume/extend a run). Returns (iteration, path), or None
-    if no checkpoint exists. Deliberately ignores ..._final.fcp, since its
-    filename doesn't encode which iteration it was written at.
-    """
+    """Find the highest-iteration scph_T{T}_iter*.fcp checkpoint in *fcp_dir*; returns (iteration, path) or None."""
     pattern = os.path.join(fcp_dir, f"scph_T{T:.0f}_iter*.fcp")
     iter_re = re.compile(r"_iter(\d+)\.fcp$")
 
@@ -427,12 +356,7 @@ def find_latest_scph_checkpoint(fcp_dir: str, T: float) -> tuple[int, str] | Non
 
 
 def load_collected_configs(configs_dir: str, T: float, n_collect: int) -> list:
-    """
-    Load configs (with forces) from the last *n_collect* SCPH-iteration
-    files found in *configs_dir* for temperature *T*. Mirrors the
-    "collect last n_collect iterations" logic in run_scph_and_collect,
-    but reads from disk instead of running SCPH.
-    """
+    """Load configs (with forces) from the last *n_collect* SCPH-iteration files on disk for temperature *T*."""
     files = find_config_files(configs_dir, T)
     if not files:
         raise FileNotFoundError(
@@ -453,10 +377,7 @@ def load_collected_configs(configs_dir: str, T: float, n_collect: int) -> list:
 
 
 def load_explicit_configs(configs_arg: str) -> list:
-    """
-    Load configs from an explicit, comma-separated list of file paths
-    and/or glob patterns given via --configs.
-    """
+    """Load configs from an explicit, comma-separated list of file paths and/or glob patterns."""
     collected = []
     n_files = 0
     for token in configs_arg.split(","):
@@ -486,10 +407,7 @@ def load_explicit_configs(configs_arg: str) -> list:
 # =============================================================================
 
 def _min_nonacoustic_freq(phonon) -> float:
-    """Min phonon frequency over the current mesh, excluding the 3 trivially
-    ~0 acoustic bands at Gamma (translational invariance) -- so this is a
-    real instability check, not just ~0 regardless of what happens
-    elsewhere in the BZ. Requires phonon.run_mesh() to have been called."""
+    """Min phonon frequency over the mesh, excluding the 3 trivial ~0 acoustic bands at Gamma. Requires phonon.run_mesh() first."""
     freqs   = phonon.mesh.frequencies.copy()
     qpoints = phonon.mesh.qpoints
     gamma_rows = np.where(np.all(np.abs(qpoints) < 1e-8, axis=1))[0]
@@ -504,27 +422,7 @@ def _min_nonacoustic_freq(phonon) -> float:
 # =============================================================================
 
 class AndersonMixer:
-    """
-    Anderson-accelerated mixing for the SCPH fixed-point update
-    x_{n+1} = f(x_n), where f(x_n) is a fresh (noisy) least-squares fit at
-    each iteration.
-
-    Plain linear mixing (x_{n+1} = beta*f(x_n) + (1-beta)*x_n) only ever
-    uses the previous iterate. Anderson mixing keeps a rolling window of
-    the last `depth` (input, output) pairs and, at each step, solves a
-    small least-squares problem for the linear combination of past
-    residuals (r_k = g_k - x_k) that best cancels the current residual,
-    then damps the result by `beta` -- typically converges in far fewer
-    iterations than plain linear mixing for this kind of fixed-point loop.
-
-    Falls back to plain linear mixing once history is empty (first call,
-    or after a safeguard drop empties it). The safeguard compares the
-    Anderson-extrapolated residual norm against the plain residual norm
-    and shrinks the history window if extrapolation made things worse --
-    this can happen when stochastic fit-data sampling noise makes recent
-    residuals nearly collinear, ill-conditioning the small least-squares
-    solve.
-    """
+    """Anderson-accelerated mixing for the SCPH fixed-point update, with a residual-growth safeguard that falls back toward plain linear mixing."""
 
     def __init__(self, depth: int = 5):
         self.depth  = depth
@@ -586,54 +484,7 @@ def run_scph_and_collect(
     mixing_depth:    int              = 5,
     log:             logging.Logger | None = None,
 ) -> tuple[np.ndarray, list, str]:
-    """
-    Run the SCPH loop on *cs2* (2nd order ClusterSpace) and accumulate
-    displaced configs + forces from the last *n_collect* iterations.
-
-    init_fc2 : optional (N, N, 3, 3) phonopy-format FC2 (e.g. loaded from a
-        previously computed fc2.hdf5). When given, it seeds the initial 2nd
-        order parameters via an algebraic ClusterSpace projection (no
-        forces/MLIP needed), replacing the small-amplitude rattled-structure
-        initialisation. Ignored if parameters_start is already given (e.g.
-        checkpoint restart).
-    fc2_only : if True (requires init_fc2), skip the iterative SCPH
-        refinement entirely: generate a single batch of thermal
-        displacements directly from init_fc2 at temperature T, evaluate
-        forces with the MLIP, and return that batch as collected_configs
-        for higher-order fitting.
-    select_best_iteration : if True, track the harmonic free energy F(T)
-        at every iteration (phonopy mesh sum on fe_mesh, no new MLIP
-        evaluations) and anchor the n_collect window of collected configs
-        on the iteration with the lowest F(T) instead of the last
-        iteration. F(T) is not guaranteed to decrease monotonically
-        (stochastic sampling noise each iteration), so this avoids
-        collecting from a worse-than-best snapshot just because it's last.
-        The lowest F(T) is picked only among iterations whose FC2 has no
-        imaginary (non-acoustic-Gamma) mode on fe_mesh -- otherwise the
-        selection can lock onto an unstable model that merely has a low
-        harmonic free energy. If no iteration is stable, raises
-        RuntimeError rather than silently returning an unstable model.
-    stability_tol : a mesh frequency (THz) is treated as imaginary only if
-        it falls below this (negative) tolerance, to avoid rejecting an
-        otherwise-stable iteration over near-zero numerical/symmetrization
-        noise in a soft optical mode.
-    mixing : "linear" (default) mixes only the previous iteration's
-        parameters (parameters_new = alpha*fit + (1-alpha)*parameters_old).
-        "anderson" additionally uses the last `mixing_depth` iterations'
-        (input, output) pairs to extrapolate a better fixed point before
-        applying the same alpha damping -- see AndersonMixer.
-    mixing_depth : history window for "anderson" mixing. Ignored for
-        "linear".
-
-    Returns
-    -------
-    (parameters_converged, collected_configs, fcp_path)
-        parameters_converged : final SCPH parameter vector
-        collected_configs    : list of hiphive-ready ASE Atoms with
-                               'displacements' and 'forces' arrays,
-                               drawn from the last n_collect iterations
-                               (or the single fc2_only batch)
-    """
+    """Run the SCPH loop on *cs2* and accumulate displaced configs + forces from the last *n_collect* iterations."""
     from hiphive.force_constant_model import ForceConstantModel
 
     if log:
@@ -722,11 +573,7 @@ def run_scph_and_collect(
         return parameters_old, tagged, fcp_path
 
     # ── SCPH iterations ───────────────────────────────────────────────────
-    # Track which iteration config files are saved so we can collect the
-    # last n_collect of them for FC3 fitting. On restart (nstart > 0), seed
-    # this with the config files already on disk from before the
-    # interruption, so --n_collect spans the full run, not just the
-    # iterations run after this restart.
+    # On restart, seed with pre-existing config files so --n_collect spans the full run.
     saved_config_files = []
     if nstart > 0:
         iter_re = re.compile(r"_iter(\d+)\.extxyz$")
@@ -738,18 +585,9 @@ def run_scph_and_collect(
             print(f"  Restart: found {len(saved_config_files)} pre-existing "
                   f"config file(s) from iterations < {nstart} in {cfg_dir}")
 
-    # [(iteration, F(T) kJ/mol), ...], only tracked if select_best_iteration.
-    # On restart, recompute F(T) for whichever pre-existing checkpoints are
-    # on disk (only every ckpt_interval iterations were saved), so the
-    # best-iteration search still spans the full run, not just the
-    # iterations run after this restart.
-    #
-    # Checkpoint scph_T{T}_iter{k}.fcp is written *after* iteration k
-    # updates parameters_old, i.e. it holds the model entering iteration
-    # k+1 -- the same model whose free energy the live loop above labels
-    # "iteration k+1". So recovered points must be relabeled it = k + 1.
-    # Iteration 0's own free energy (from the initial, pre-loop model) has
-    # no corresponding checkpoint and cannot be recovered after a restart.
+    # On restart, recompute F(T) for pre-existing checkpoints so best-iteration search
+    # spans the full run. Checkpoint iter{k}.fcp holds the model entering iteration k+1,
+    # so recovered points are relabeled it = k+1; iteration 0's F(T) is unrecoverable.
     free_energies = []
     if select_best_iteration and nstart > 0:
         iter_re_fcp = re.compile(r"_iter(\d+)\.fcp$")
@@ -828,8 +666,6 @@ def run_scph_and_collect(
         opt = Optimizer(sc.get_fit_data(), train_size=1.0, check_condition=False)
         opt.train()
 
-        # Update parameters: plain linear/damped mixing, or Anderson-
-        # accelerated mixing over the last `mixing_depth` iterations.
         if mixer is not None:
             parameters_new = mixer.mix(parameters_old, opt.parameters, beta=alpha)
         else:
@@ -868,13 +704,8 @@ def run_scph_and_collect(
     if log:
         log.info(f"final SCPH FCP -> {fcp_path}")
 
-    # Collect configs for the higher-order fit: either the last n_collect
-    # iterations (default), or -- if select_best_iteration -- the n_collect
-    # iterations ending at whichever iteration had the lowest F(T) among
-    # iterations with no imaginary (non-acoustic-Gamma) mode on fe_mesh, since
-    # F(T) is not guaranteed to decrease monotonically iteration to
-    # iteration (stochastic sampling noise), and a low F(T) from an unstable
-    # model is not a meaningful comparison to a stable one.
+    # Collect configs from the last n_collect iterations, or (if select_best_iteration)
+    # from the n_collect window ending at the lowest-F(T) stable iteration.
     if select_best_iteration and free_energies:
         stable = [x for x in free_energies if x[2] > stability_tol]
         if not stable:
@@ -940,11 +771,7 @@ def fit_force_constants(
     symprec:     float,
     train_size:  float = 1.0,
 ) -> ForceConstantPotential:
-    """
-    Fit a joint ForceConstantPotential to *configs*, spanning body orders
-    2..max_order where max_order = len(cutoffs) + 1 (e.g. cutoffs=[c2, c3]
-    fits 2nd+3rd order, cutoffs=[c2, c3, c4] fits 2nd..4th order).
-    """
+    """Fit a joint ForceConstantPotential to *configs*, spanning body orders 2..len(cutoffs)+1."""
     max_order = len(cutoffs) + 1
     print(f"\n  Fitting FC2..FC{max_order}: cutoffs={cutoffs} Å  "
           f"n_configs={len(configs)}")
@@ -957,25 +784,13 @@ def fit_force_constants(
     print(cs)
     cs.print_orbits()
 
-    # By hiphive convention (see evaluate_forces) every saved config's cell
-    # and positions are supposed to be bit-identical to *supercell* -- only
-    # 'displacements'/'forces' vary per structure. Configs reloaded from
-    # extxyz go through ASE's %16.8f-precision writer, which is far below
-    # symprec but, for cells sitting near a symmetry degeneracy, can still
-    # be enough to make spglib's primitive-cell standardization (called
-    # independently per structure in hiphive's align_supercell) pick a
-    # different-but-equivalent orientation than the one baked into
-    # cs.primitive_structure -- causing a spurious "Found no translation!"
-    # for every structure. Snap cell/positions back onto the authoritative
-    # in-memory supercell to remove that precision mismatch entirely.
+    # Snap each config's cell/positions onto the authoritative in-memory supercell:
+    # extxyz's reduced write precision can otherwise make spglib pick a different
+    # (but equivalent) primitive orientation per structure, causing a spurious
+    # "Found no translation!" in hiphive. Pull forces into a plain array first --
+    # set_positions() below invalidates the SinglePointCalculator they load into.
     for s in configs:
         if len(s) == len(supercell):
-            # Forces read back from extxyz live on a SinglePointCalculator
-            # (forces is a canonical ASE property), not in s.arrays.
-            # set_positions() below would invalidate that calculator (its
-            # cached check_state no longer matches), so pull forces out
-            # into a plain array first -- that survives the reposition
-            # and is what hiphive's add_structure looks for directly.
             if "forces" not in s.arrays:
                 s.set_array("forces", s.get_forces())
             s.cell = supercell.cell
@@ -1015,17 +830,7 @@ def export_to_phono3py(
     out_dir:   str,
     max_order: int,
 ) -> dict:
-    """
-    Export every fitted order (2..max_order) to disk.
-
-    FC2: hiphive ASE (3N,3N) -> reshape+transpose -> (N,N,3,3) [phono3py]
-    FC3: hiphive default (N,N,N,3,3,3) = phono3py full FC3, no transposition
-    FC4+ : phono3py has no native reader for these, so they're written to
-           generic fc{n}.hdf5 files (dataset "fc{n}", hiphive's raw shape)
-           for use with custom four(+)-phonon tooling.
-
-    Returns a dict {order: fc_array} for every order actually exported.
-    """
+    """Export every fitted order (2..max_order) to disk; orders >3 go to generic fc{n}.hdf5 (no native phono3py reader)."""
     fcs = fcp.get_force_constants(supercell)
     N   = len(supercell)
     exported = {}

@@ -1,8 +1,4 @@
-"""Overlay phonon band structures from saved SCPH .fcp checkpoints on one high-symmetry path.
-
-python plot_scph_bands.py -prim POSCAR-unitcell -sdim "2 2 2" \\
-    -o output/ -temps "300" --npoints 101
-"""
+"""Overlay phonon band structures from saved SCPH .fcp checkpoints on one high-symmetry path."""
 
 from __future__ import annotations
 

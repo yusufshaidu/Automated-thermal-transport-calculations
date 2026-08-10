@@ -1,12 +1,4 @@
-"""phono3py_compat.py
-
-Compatibility helpers for phono3py v3.x vs v4.x: CLI split into
-phono3py-init/phono3py, compact-FC default, primitive_matrix default,
-Rust backend, and the grid/tetrahedron/kaccum move to phonopy. Imported by
-thermal_transport_agent.py and generate_scph_fc2_fc3_agent.py.
-
-Reference: https://phonopy.github.io/phono3py/migration-v4.html
-"""
+"""Compatibility helpers for phono3py v3.x vs v4.x API/CLI differences."""
 
 from __future__ import annotations
 
@@ -56,15 +48,7 @@ def print_version_banner(log: logging.Logger | None = None) -> str:
 # =============================================================================
 
 def get_thermal_conductivity_RTA_compat(interaction, **kwargs):
-    """
-    Call get_thermal_conductivity_RTA regardless of which module path it
-    lives at in the installed phono3py version.
-
-    Tries, in order:
-        phono3py.conductivity.rta_init    (v3.x and current v4.x)
-        phono3py.conductivity.rta         (possible future refactor path)
-        phono3py.phonon3.conductivity_RTA (legacy v2.x path)
-    """
+    """Call get_thermal_conductivity_RTA regardless of which module path it lives at in the installed phono3py version."""
     last_err = None
     candidates = [
         "phono3py.conductivity.rta_init",
@@ -98,29 +82,7 @@ def get_thermal_conductivity_RTA_compat(interaction, **kwargs):
 # =============================================================================
 
 def get_ir_grid_points_compat(bz_grid):
-    """
-    Return irreducible grid point indices in phono3py's BZGrid numbering,
-    regardless of which module get_ir_grid_points() lives in for the
-    installed phono3py/phonopy version.
-
-    v4.0.0 moved the grid module from phono3py to phonopy
-    (phonopy.phonon.grid.BZGrid, get_ir_grid_points, etc. — see the
-    migration note at the top of this file), so the import path to use
-    is version-dependent:
-
-        phonopy.phonon.grid   (v4.x — current)
-        phono3py.phonon.grid  (v3.x — legacy, pre-migration)
-
-    get_ir_grid_points(bz_grid) returns indices in GR-grid space; the
-    caller must map them to BZ-grid space via bz_grid.grg2bzg[...] to
-    match the indices phono3py uses when writing kappa-m*-g{N}.hdf5
-    filenames.
-
-    Returns
-    -------
-    (ir_grid_points, ir_grid_weights, ir_grid_map) in GR-grid indexing,
-    exactly as returned by the underlying get_ir_grid_points().
-    """
+    """Return irreducible grid point indices, regardless of which module get_ir_grid_points() lives in for the installed phono3py/phonopy version."""
     last_err = None
     candidates = (
         ["phonopy.phonon.grid", "phono3py.phonon.grid"]
@@ -163,19 +125,7 @@ def recommend_bte_cli(
     tstep:     float = 25,
     full_fc:   bool   = True,
 ) -> str:
-    """
-    Return a phono3py CLI command string appropriate for the detected
-    phono3py version, to run thermal conductivity from existing
-    fc2.hdf5 / fc3.hdf5 (e.g. generated via the Python API / SCPH workflow).
-
-    Parameters
-    ----------
-    full_fc : bool
-        Set True if the FC2/FC3 HDF5 files were written in full
-        (non-compact) format — i.e. produce_fc3(is_compact_fc=False)
-        was used. This adds --full-fc on phono3py >= 4 so the CLI reads
-        them correctly (compact is the v4 default).
-    """
+    """Return a phono3py CLI command string appropriate for the detected phono3py version to run thermal conductivity from existing fc2.hdf5 / fc3.hdf5."""
     fc_flag = " --full-fc" if (full_fc and is_v4_or_later()) else ""
 
     if is_v4_or_later():

@@ -1,15 +1,4 @@
-"""Cumulative kappa_inter vs frequency-gap cutoff, comparing SMM19/NJC23/IBDB19.
-
-Pinpoints exactly which band-pair frequency gaps each transport_type's
-coherence conductivity comes from, using phono3py's own per-band-pair
-mode_kappa_matrix (not saved to kappa-m*.hdf5, so this recomputes it) --
-but reuses the already-cached gamma (read_gamma=True), so no new
-phonon-phonon scattering is computed. Requires the same environment as
-thermal_transport_agent.py (phono3py, ase, ...); run it there.
-
-python plot_cumulative_kappa_inter.py --out_dir results/ --structure POSCAR-unitcell \\
-    --supercell "2 2 2" --mesh "19 19 19" --temperature 300 --solver rta
-"""
+"""Plots cumulative kappa_inter vs frequency-gap cutoff, comparing SMM19/NJC23/IBDB19."""
 
 from __future__ import annotations
 
@@ -25,15 +14,7 @@ from thermal_transport_agent import Config, load_ph3_from_disk, _init_phph
 
 
 def detect_stored_temperatures(out_dir: str, mesh_tag: str) -> list[float]:
-    """
-    read_gamma=True expects `temperatures=` to request exactly the full set
-    of temperatures already stored in the cached gamma file -- it can't
-    select a subset on read (a shape mismatch like "target (1, n, b) vs
-    from file (12, n, b)" means this wasn't done). So this reads whatever
-    temperatures the original bte run actually computed, from either the
-    aggregate kappa-m{tag}.hdf5 or, failing that, one of the per-q
-    kappa-m{tag}-g*.hdf5 files.
-    """
+    """Reads which temperatures are already stored in the cached gamma file(s) in out_dir."""
     candidates = [os.path.join(out_dir, f"kappa-m{mesh_tag}.hdf5")]
     candidates += sorted(glob.glob(os.path.join(out_dir, f"kappa-m{mesh_tag}-g*.hdf5")))
     for path in candidates:
@@ -47,19 +28,7 @@ def detect_stored_temperatures(out_dir: str, mesh_tag: str) -> list[float]:
 
 
 def compute_pair_kappa(ph3, cfg: Config, all_temps: list[float], T: float, transport_type: str):
-    """Run read_gamma=True for one transport_type and return per-pair data.
-
-    Must request the full set of temperatures already stored in the cached
-    gamma file (all_temps), not just the one being analyzed (T) -- phono3py
-    can't select a subset when reading gamma from disk. i_temp then picks
-    out T's slice from the results afterward.
-
-    Returns (dw, contribution, kappa_inter_iso_total) where dw and
-    contribution are flat arrays over every (grid point, band pair) with
-    s != s', already iso-averaged (mean of xx, yy, zz) and normalised so
-    that contribution.sum() == kappa_inter_iso_total (this equality is a
-    built-in sanity check, printed by the caller).
-    """
+    """Runs read_gamma=True for one transport_type and returns per-band-pair kappa_inter data."""
     is_lbte = cfg.solver.lower() == "lbte"
     i_temp  = int(np.argmin(np.abs(np.array(all_temps) - T)))
 
@@ -110,10 +79,7 @@ def compute_pair_kappa(ph3, cfg: Config, all_temps: list[float], T: float, trans
 
 
 def compute_pair_kappa_2d(ph3, cfg: Config, all_temps: list[float], T: float, transport_type: str):
-    """Like compute_pair_kappa, but keeps omega_i, omega_j (not just their
-    gap) and the per-grid-point BZ weight, for an omega_i vs omega_j heatmap.
-    Mirrored across the diagonal like plot_coherence_regime.pairwise_cqij.
-    """
+    """Like compute_pair_kappa, but keeps omega_i, omega_j, and BZ weight for an omega_i vs omega_j heatmap."""
     is_lbte = cfg.solver.lower() == "lbte"
     i_temp  = int(np.argmin(np.abs(np.array(all_temps) - T)))
 
@@ -168,14 +134,7 @@ def compute_pair_kappa_2d(ph3, cfg: Config, all_temps: list[float], T: float, tr
 def plot_kappa_inter_diff_heatmap(wi, wj, diff, weight, freq, gp_weight, T, out_png,
                                    component_label, tt_a, tt_b, n_bins: int = 60,
                                    annotate_threshold: float | None = None):
-    """omega_i vs omega_j, colored by <kappa_inter[tt_a] - kappa_inter[tt_b]>_q.
-
-    Unlike the pure C_ss' heatmap in plot_coherence_regime.py, this already
-    includes the velocity coupling |V_ss'|^2 and the resonance kernel, so it
-    shows where the *actual reported* kappa_inter difference between two
-    transport_types comes from -- not just where the formulas' heat
-    capacities disagree, but where that disagreement actually moves the number.
-    """
+    """Plots omega_i vs omega_j heatmap colored by <kappa_inter[tt_a] - kappa_inter[tt_b]>_q."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -189,9 +148,7 @@ def plot_kappa_inter_diff_heatmap(wi, wj, diff, weight, freq, gp_weight, T, out_
         avg = sum_wd / sum_w
     avg = np.ma.masked_invalid(avg)
 
-    # Signed (unlike the Cqij-only heatmap, an arbitrary pair of transport_types
-    # isn't guaranteed to have a fixed-sign difference), so use a diverging
-    # colormap centered at 0 rather than assuming one side is always positive.
+    # Signed: an arbitrary pair of transport_types isn't guaranteed a fixed-sign difference.
     vmax = float(np.abs(avg.compressed()).max()) if avg.count() else 1.0
     cmap = matplotlib.colormaps["RdBu_r"].copy()
     cmap.set_bad(color="#bbbbbb")

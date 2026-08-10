@@ -1,8 +1,4 @@
-"""Plot free energy F(T) and minimum phonon frequency vs. SCPH iteration from saved .fcp checkpoints.
-
-python plot_scph_free_energy.py -prim POSCAR-unitcell -sdim "2 2 2" \\
-    -o output/ -temps "100 200 300" --mesh "20 20 20"
-"""
+"""Plot free energy F(T) and minimum phonon frequency vs. SCPH iteration from saved .fcp checkpoints."""
 
 from __future__ import annotations
 
@@ -55,9 +51,6 @@ def load_fc2_into_phonon(fcp_path: str, supercell, phonon) -> np.ndarray:
 
     fcp = ForceConstantPotential.read(fcp_path)
 
-    # fcp.primitive_structure is hiphive's symmetry-reduced primitive (e.g. 1
-    # atom for fcc), not the ClusterSpace supercell — not comparable to N.
-    # The real shape check is on the FC2 array itself, below.
     fc2 = fcp.get_force_constants(supercell).get_fc_array(order=2, format="phonopy")
     if fc2.shape != (N, N, 3, 3):
         raise ValueError(
@@ -84,10 +77,7 @@ def analyze_fcp(
     load_fc2_into_phonon(fcp_path, supercell, phonon)
     phonon.run_mesh(mesh, is_gamma_center=True)
 
-    # The 3 acoustic bands at Gamma are trivially ~0 by translational
-    # invariance, for any structure, stable or not -- excluding them from
-    # the minimum is what makes this a real instability check rather than
-    # always reporting ~0 regardless of what happens elsewhere in the BZ.
+    # Exclude the 3 trivially ~0 acoustic bands at Gamma, or this always reports ~0.
     freqs   = phonon.mesh.frequencies.copy()
     qpoints = phonon.mesh.qpoints
     gamma_rows = np.where(np.all(np.abs(qpoints) < 1e-8, axis=1))[0]
