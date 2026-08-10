@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore")
 
 from ase import Atoms, units
 from ase.calculators.mixing import SumCalculator
-from ase.filters import FrechetCellFilter
+from ase.filters import FrechetCellFilter, UnitCellFilter
 from ase.io import read as ase_read, write as ase_write
 from ase.optimize import FIRE, BFGS
 
@@ -500,7 +500,8 @@ def stage_relax(
     log.info(f"  E0 = {e0:.6f} eV   V0 = {v0:.3f} Å^3")
 
     p_eV = cfg.relax_pressure * 0.00624
-    filt = FrechetCellFilter(atoms, scalar_pressure=p_eV)
+    #filt = FrechetCellFilter(atoms, scalar_pressure=p_eV)
+    filt = UnitCellFilter(atoms, mask=[True, True, True, False, False, False], scalar_pressure=p_eV)
 
     #log.info(f"  FIRE  fmax = {cfg.relax_fmax*10:.4f} eV/Å …")
     #FIRE(filt, logfile=str(out_dir / "relax_FIRE.log")).run(

@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import time
+from collections import deque
 
 import numpy as np
 from ase import Atoms, units
@@ -498,6 +499,64 @@ def _min_nonacoustic_freq(phonon) -> float:
     return float(np.min(freqs))
 
 
+# =============================================================================
+# Anderson-accelerated parameter mixing
+# =============================================================================
+
+class AndersonMixer:
+    """
+    Anderson-accelerated mixing for the SCPH fixed-point update
+    x_{n+1} = f(x_n), where f(x_n) is a fresh (noisy) least-squares fit at
+    each iteration.
+
+    Plain linear mixing (x_{n+1} = beta*f(x_n) + (1-beta)*x_n) only ever
+    uses the previous iterate. Anderson mixing keeps a rolling window of
+    the last `depth` (input, output) pairs and, at each step, solves a
+    small least-squares problem for the linear combination of past
+    residuals (r_k = g_k - x_k) that best cancels the current residual,
+    then damps the result by `beta` -- typically converges in far fewer
+    iterations than plain linear mixing for this kind of fixed-point loop.
+
+    Falls back to plain linear mixing once history is empty (first call,
+    or after a safeguard drop empties it). The safeguard compares the
+    Anderson-extrapolated residual norm against the plain residual norm
+    and shrinks the history window if extrapolation made things worse --
+    this can happen when stochastic fit-data sampling noise makes recent
+    residuals nearly collinear, ill-conditioning the small least-squares
+    solve.
+    """
+
+    def __init__(self, depth: int = 5):
+        self.depth  = depth
+        self._x_hist = deque(maxlen=depth)
+        self._g_hist = deque(maxlen=depth)
+
+    def mix(self, x_n: np.ndarray, g_n: np.ndarray, beta: float) -> np.ndarray:
+        r_n = g_n - x_n
+        x_new, r_bar = self._propose(x_n, g_n, r_n, beta)
+        while self._x_hist and np.linalg.norm(r_bar) > np.linalg.norm(r_n):
+            self._x_hist.popleft()
+            self._g_hist.popleft()
+            x_new, r_bar = self._propose(x_n, g_n, r_n, beta)
+        self._x_hist.append(x_n.copy())
+        self._g_hist.append(g_n.copy())
+        return x_new
+
+    def _propose(self, x_n, g_n, r_n, beta):
+        if not self._x_hist:
+            return beta * g_n + (1 - beta) * x_n, r_n
+
+        r_hist = [g_k - x_k for x_k, g_k in zip(self._x_hist, self._g_hist)]
+        dR = np.column_stack([r_n - r_k for r_k in r_hist])
+        gamma, *_ = np.linalg.lstsq(dR, r_n, rcond=None)
+
+        dX = np.column_stack([x_n - x_k for x_k in self._x_hist])
+        dG = np.column_stack([g_n - g_k for g_k in self._g_hist])
+        x_bar = x_n - dX @ gamma
+        g_bar = g_n - dG @ gamma
+        return beta * g_bar + (1 - beta) * x_bar, g_bar - x_bar
+
+
 def run_scph_and_collect(
     supercell:       Atoms,
     cs2:             ClusterSpace,    # 2nd order only (SCPH)
@@ -523,6 +582,8 @@ def run_scph_and_collect(
     select_best_iteration: bool       = False,
     fe_mesh:         list[int] | None = None,
     stability_tol:   float            = -0.01,
+    mixing:          str              = "linear",
+    mixing_depth:    int              = 5,
     log:             logging.Logger | None = None,
 ) -> tuple[np.ndarray, list, str]:
     """
@@ -556,6 +617,13 @@ def run_scph_and_collect(
         it falls below this (negative) tolerance, to avoid rejecting an
         otherwise-stable iteration over near-zero numerical/symmetrization
         noise in a soft optical mode.
+    mixing : "linear" (default) mixes only the previous iteration's
+        parameters (parameters_new = alpha*fit + (1-alpha)*parameters_old).
+        "anderson" additionally uses the last `mixing_depth` iterations'
+        (input, output) pairs to extrapolate a better fixed point before
+        applying the same alpha damping -- see AndersonMixer.
+    mixing_depth : history window for "anderson" mixing. Ignored for
+        "linear".
 
     Returns
     -------
@@ -571,13 +639,16 @@ def run_scph_and_collect(
     if log:
         log.info(f"SCPH start: T={T:.0f}K  n_iterations={n_iterations}  "
                  f"n_structures={n_structures}  alpha={alpha}  "
-                 f"qm_statistics={qm_statistics}  fc2_only={fc2_only}  "
+                 f"mixing={mixing}"
+                 + (f"  mixing_depth={mixing_depth}" if mixing == "anderson" else "")
+                 + f"  qm_statistics={qm_statistics}  fc2_only={fc2_only}  "
                  f"select_best_iteration={select_best_iteration}"
                  + (f"  fe_mesh={fe_mesh}  stability_tol={stability_tol}"
                     if select_best_iteration else ""))
 
     sc  = StructureContainer(cs2)
     fcm = ForceConstantModel(supercell, cs2)
+    mixer = AndersonMixer(depth=mixing_depth) if mixing == "anderson" else None
 
     # Choose displacement method
     disp_method = DisplacementMethod.PHONOPY if qm_statistics \
@@ -757,8 +828,12 @@ def run_scph_and_collect(
         opt = Optimizer(sc.get_fit_data(), train_size=1.0, check_condition=False)
         opt.train()
 
-        # Update parameters with momentum
-        parameters_new = alpha * opt.parameters + (1 - alpha) * parameters_old
+        # Update parameters: plain linear/damped mixing, or Anderson-
+        # accelerated mixing over the last `mixing_depth` iterations.
+        if mixer is not None:
+            parameters_new = mixer.mix(parameters_old, opt.parameters, beta=alpha)
+        else:
+            parameters_new = alpha * opt.parameters + (1 - alpha) * parameters_old
 
         disps         = np.concatenate([s.get_array("displacements") for s in tagged])
         delta_x_norm  = np.linalg.norm(parameters_old - parameters_new) / \
@@ -881,6 +956,30 @@ def fit_force_constants(
     )
     print(cs)
     cs.print_orbits()
+
+    # By hiphive convention (see evaluate_forces) every saved config's cell
+    # and positions are supposed to be bit-identical to *supercell* -- only
+    # 'displacements'/'forces' vary per structure. Configs reloaded from
+    # extxyz go through ASE's %16.8f-precision writer, which is far below
+    # symprec but, for cells sitting near a symmetry degeneracy, can still
+    # be enough to make spglib's primitive-cell standardization (called
+    # independently per structure in hiphive's align_supercell) pick a
+    # different-but-equivalent orientation than the one baked into
+    # cs.primitive_structure -- causing a spurious "Found no translation!"
+    # for every structure. Snap cell/positions back onto the authoritative
+    # in-memory supercell to remove that precision mismatch entirely.
+    for s in configs:
+        if len(s) == len(supercell):
+            # Forces read back from extxyz live on a SinglePointCalculator
+            # (forces is a canonical ASE property), not in s.arrays.
+            # set_positions() below would invalidate that calculator (its
+            # cached check_state no longer matches), so pull forces out
+            # into a plain array first -- that survives the reposition
+            # and is what hiphive's add_structure looks for directly.
+            if "forces" not in s.arrays:
+                s.set_array("forces", s.get_forces())
+            s.cell = supercell.cell
+            s.set_positions(supercell.positions)
 
     sc = StructureContainer(cs)
     n_ok = 0
@@ -1168,6 +1267,8 @@ def main(args):
                 select_best_iteration = args.select_best_iteration,
                 fe_mesh          = fe_mesh,
                 stability_tol    = args.stability_tol,
+                mixing           = args.mixing,
+                mixing_depth     = args.mixing_depth,
                 log              = log,
             )
 
@@ -1264,6 +1365,18 @@ if __name__ == "__main__":
                    help="Ignored with --skip_scph")
     p.add_argument("-alpha",  "--alpha",         type=float, default=0.2,
                    help="SCPH momentum (learning rate); ignored with --skip_scph")
+    p.add_argument("--mixing", default="linear", choices=["linear", "anderson"],
+                   help="Parameter-update scheme between SCPH iterations. "
+                        "'linear' (default) mixes only the previous "
+                        "iteration's fit, weighted by --alpha. 'anderson' "
+                        "additionally extrapolates from the last "
+                        "--mixing_depth iterations' inputs/outputs before "
+                        "applying the same --alpha damping -- typically "
+                        "converges in fewer iterations. Ignored with "
+                        "--skip_scph.")
+    p.add_argument("--mixing_depth", type=int, default=5,
+                   help="History window (# past iterations) for "
+                        "--mixing anderson. Ignored for --mixing linear.")
     p.add_argument("-cutoffs", "--cutoffs",      required=True,
                    help="Space-separated cluster cutoffs (Å), one per body "
                         "order starting at 2nd order. N cutoffs fit orders "
