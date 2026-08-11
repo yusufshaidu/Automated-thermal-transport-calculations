@@ -3,10 +3,10 @@
 MACE/UMA machine-learned interatomic potentials + phono3py for lattice
 thermal conductivity kappa(T). `thermal_transport_agent.py` runs the full
 finite-displacement pipeline (relax -> forces -> FC2/FC3 -> BTE -> kappa(T)).
-`generate_scph_fc2_fc3_agent.py` instead produces temperature-renormalized
-force constants via a self-consistent phonon (SCPH) loop, for strongly
-anharmonic materials -- its output feeds into `thermal_transport_agent.py
-bte`. `plot_scph_free_energy.py`/`plot_scph_bands.py` are convergence
+`generate_scph_fc2_fc3_agent.py` produces temperature-renormalized force
+constants via a self-consistent phonon (SCPH) loop; its output feeds into
+`thermal_transport_agent.py bte`. `plot_scph_free_energy.py`/
+`plot_scph_bands.py` are convergence
 diagnostics for an SCPH run. `phono3py_compat.py` is a shared
 phono3py v3.x/v4.x compatibility helper and must stay alongside the other
 scripts.
@@ -117,9 +117,8 @@ only the atom count is checked automatically.
 
 For every `--fmax`/`--noise` combination, relaxes independently from
 `--structure`, fits a finite-displacement FC2, and reports the minimum
-non-acoustic frequency on `--mesh`. `--noise` rattles the structure first
-(`ase.Atoms.rattle`) to break symmetry that can otherwise pin a relaxation
-at a saddle point regardless of `--fmax`.
+non-acoustic frequency on `--mesh`. `--noise` rattles the structure
+(`ase.Atoms.rattle`, seeded by `--noise_seed`) before each relaxation.
 
 ```bash
 python scan_relax_fmax_imaginary_modes.py \
@@ -135,9 +134,32 @@ Writes `fmax_{f}_noise_{n}/{POSCAR-relaxed, fc2.hdf5, result.json}` plus
 imaginary modes. Reruns skip already-done combinations (`--overwrite` to
 force). Calculator flags match `thermal_transport_agent.py`.
 
+## `phonons_from_fc2.py`
+
+Reports band structure (with an exact-q imaginary-mode check along
+`--band_path`, not a mesh minimum), DOS, thermal properties, and MSD from a
+saved `fc2.hdf5` or `FORCE_SETS`. Exits non-zero if any band-path q-point is
+imaginary.
+
+```bash
+python phonons_from_fc2.py \
+    --indir output/T300 --out_dir analysis/T300 \
+    --supercell "2 2 2" --primitive_matrix auto \
+    --band_path hex --dos --thermal --msd
+```
+
+Writes `bands.{yaml,png}` always; `total_dos.{dat,png}` with `--dos`;
+`thermal_properties.{dat,yaml,png}` (+ `debye_fit.png` unless
+`--debye_tmax 0`) with `--thermal`; `msd_vs_T.dat` with `--msd`.
+`--band_path` is `hex` (G-M-K-G-A-L-H-A-L-M-K-H) or `ortho`
+(G-P-Z-Q-G-F-P1-Q1-L-Z). `--mesh` (used only by `--dos`/`--thermal`) warns if
+it can't land on `hex`'s K/H points (1/3, 1/3, \*) -- the band-path check is
+the one that determines stability, not the mesh.
+
 ## `plot_coherence_regime.py`
 
-Compare different transpert type (SMM19/NJC23/IBDB19) 
+Compares transport-type formulations (SMM19/NJC23/IBDB19) from an existing
+`kappa-m*.hdf5` (no new BTE run).
 
 ```bash
 python plot_coherence_regime.py --kappa_hdf5 results/kappa-m191919.hdf5 --temperature 300
