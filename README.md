@@ -95,10 +95,49 @@ python plot_scph_bands.py -prim POSCAR-unitcell -sdim "2 2 2" \
 `-prim`/`-sdim`/`-pa`/`-tolerance` must match the SCPH run being inspected.
 Outputs land in `output/T{T}/`.
 
+## `combine_scph_fc2_fc3.py`
+
+Extracts the lowest-F(T), stable FC2 from `fcp_scph/scph_T{T}_iter*.fcp`
+checkpoints (not the joint FC2..FC3 refit's `fc2.hdf5`) and can pair it with
+an FC3 from a separate finite-displacement `thermal_transport_agent.py` run.
+
+```bash
+python combine_scph_fc2_fc3.py \
+    -prim POSCAR-unitcell -sdim "2 2 2" -o output/ -temps "300" \
+    --fc3_dir results_finite_disp/
+```
+
+Writes `output/T300/fc2_scph_best.hdf5` and, with `--fc3_dir`, a
+`combined_scph_fc2_finite_fc3/` dir plus the matching `bte` command.
+`-prim`/`-sdim`/`-pa`/`-tolerance` must match the SCPH run; make sure
+`--fc3_dir`'s run used the same supercell/primitive matrix/symprec too —
+only the atom count is checked automatically.
+
+## `scan_relax_fmax_imaginary_modes.py`
+
+For every `--fmax`/`--noise` combination, relaxes independently from
+`--structure`, fits a finite-displacement FC2, and reports the minimum
+non-acoustic frequency on `--mesh`. `--noise` rattles the structure first
+(`ase.Atoms.rattle`) to break symmetry that can otherwise pin a relaxation
+at a saddle point regardless of `--fmax`.
+
+```bash
+python scan_relax_fmax_imaginary_modes.py \
+    --structure POSCAR --out_dir relax_scan/ \
+    --fmax "0.05 0.01 0.005 0.001 0.0001" \
+    --noise "0.0 0.02 0.05" \
+    --supercell "2 2 2" --mesh "20 20 20" \
+    --mace_model path/to/mace.model --mace_device cuda
+```
+
+Writes `fmax_{f}_noise_{n}/{POSCAR-relaxed, fc2.hdf5, result.json}` plus
+`relax_scan_summary.{json,png}`; a negative `min_frequency_THz` means
+imaginary modes. Reruns skip already-done combinations (`--overwrite` to
+force). Calculator flags match `thermal_transport_agent.py`.
+
 ## `plot_coherence_regime.py`
 
-Diagnoses why `--transport_type` (SMM19/NJC23/IBDB19) formulations disagree
-on `kappa_inter`, from an existing `kappa-m*.hdf5` (no new BTE run).
+Compare different transpert type (SMM19/NJC23/IBDB19) 
 
 ```bash
 python plot_coherence_regime.py --kappa_hdf5 results/kappa-m191919.hdf5 --temperature 300
