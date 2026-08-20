@@ -1,20 +1,25 @@
 # Thermal Transport Toolkit
 
-MACE/UMA machine-learned interatomic potentials + phono3py for lattice
-thermal conductivity kappa(T). `thermal_transport_agent.py` runs the full
-finite-displacement pipeline (relax -> forces -> FC2/FC3 -> BTE -> kappa(T)).
-`generate_scph_fc2_fc3_agent.py` produces temperature-renormalized force
-constants via a self-consistent phonon (SCPH) loop; its output feeds into
-`thermal_transport_agent.py bte`. `plot_scph_free_energy.py`/
-`plot_scph_bands.py` are convergence
+machine-learned interatomic potentials interfaced with phonopy/phono3py for lattice
+thermal conductivity kappa(T). 
+
+- `thermal_transport_agent.py` runs the full
+finite-displacement pipeline (relax -> forces -> FC2/FC3 -> BTE -> kappa(T)) and 
+kappa can be calculated with interband contributions
+
+- `generate_scph_fc2_fc3_agent.py` produces temperature-renormalized force
+constants via a self-consistent phonon (SCPH) loop based on hiphive; 
+its output can be fed into `thermal_transport_agent.py bte` for thermal conductvity using 
+temperature dependent force constants. 
+- `plot_scph_free_energy.py`/ `plot_scph_bands.py` are convergence
 diagnostics for an SCPH run. `phono3py_compat.py` is a shared
 phono3py v3.x/v4.x compatibility helper and must stay alongside the other
 scripts.
 
-## Installation
+## Installation and Usage
 
 ```bash
-conda create -n thermal python=3.10 && conda activate thermal
+conda create -n thermal python=3.** && conda activate thermal
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # or cu118 for GPU
 pip install mace-torch phono3py phonopy h5py ase
 pip install hiphive trainstation        # generate_scph_fc2_fc3_agent.py + plot_scph_*.py
@@ -49,15 +54,6 @@ Rerunning `bte` with only `--transport_type` changed reuses cached phonon
 lifetimes (cheap); changing mesh/solver/isotope/mass_variances/temperatures
 triggers a full recompute.
 
-Notes:
-- `--cutoff_frequency` (default `1e-2` THz) excludes near-zero modes from
-  every BTE/coherence sum. SCPH-fit FC2s can leave a larger spurious
-  Gamma-acoustic residual than finite-displacement FC2s; raise this
-  (e.g. `0.05`-`0.1`) if `NJC23` disagrees sharply with `IBDB19`/`SMM19`.
-- `bte`/`collect` symmetrize loaded FC2/FC3 by default
-  (`--skip_fc_symmetrize` to disable) — important for hiphive-fit SCPH
-  force constants, which aren't guaranteed symmetric on load.
-
 ## `generate_scph_fc2_fc3_agent.py`
 
 ```bash
@@ -74,11 +70,6 @@ the lowest-free-energy stable iteration instead of the last one),
 `--skip_scph --configs_dir <dir>` (refit with different `-cutoffs` reusing
 saved configs), `--init_fc2 <fc2.hdf5>` (seed from a converged FC2 at
 another temperature). Run with `--help` for the full list.
-
-`-tolerance`/`--symprec` (default `1e-3`) should match across this script,
-`thermal_transport_agent.py bte --symprec`, and `plot_scph_*.py
--tolerance` — a mismatch can make the FC fit and downstream BTE disagree
-about the structure's symmetry.
 
 ## `plot_scph_free_energy.py` / `plot_scph_bands.py`
 

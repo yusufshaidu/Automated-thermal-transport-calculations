@@ -202,6 +202,22 @@ def _init_phph(ph3: Phono3py, log: logging.Logger | None = None) -> None:
         logging.info(done_msg)
 
 
+def _symmetrize_fc(ph3: Phono3py) -> None:
+    """Symmetrize loaded FC2/FC3 using the API available for the installed phono3py version.
+
+    v4+ split this into per-FC symmetrize_fc2()/symmetrize_fc3(); v3.x only has the
+    combined set_permutation_symmetry()/set_translational_invariance() (fc2+fc3 together).
+    """
+    t0 = time.time()
+    if is_v4_or_later():
+        ph3.symmetrize_fc2()
+        ph3.symmetrize_fc3()
+    else:
+        ph3.set_permutation_symmetry()
+        ph3.set_translational_invariance()
+    logging.info(f"  Symmetrized loaded FC2/FC3 ({time.time()-t0:.1f}s)")
+
+
 # =============================================================================
 # BTE settings resolver
 # =============================================================================
@@ -255,7 +271,11 @@ def ase_to_phonopy(atoms: Atoms) -> PhonopyAtoms:
     return PhonopyAtoms(
         symbols          = atoms.get_chemical_symbols(),
         cell             = atoms.get_cell()[:],
-        scaled_positions = atoms.get_scaled_positions(),
+        #scaled_positions = atoms.get_scaled_positions(),
+        # When loading fc2 and fc3 from disk, since the supercell is rebuilt from the relaxed poscar,
+        # a scaled positions can reorder atoms at the border leading to a mismatch between the generated fc2 and the new 
+        # created supercell positions. A safer apporach is the use the cartesian positions
+        positions = atoms.get_positions(),
     )
 
 
@@ -263,7 +283,7 @@ def phonopy_to_ase(ph: PhonopyAtoms) -> Atoms:
     return Atoms(
         numbers          = ph.numbers,
         cell             = ph.cell,
-        scaled_positions = ph.scaled_positions,
+        positions = ph.positions,
         pbc              = True,
     )
 
@@ -423,13 +443,13 @@ def stage_relax(
     log.info(f"  E0 = {e0:.6f} eV   V0 = {v0:.3f} Å^3")
 
     p_eV = cfg.relax_pressure * 0.00624
-    #filt = FrechetCellFilter(atoms, scalar_pressure=p_eV)
-    filt = UnitCellFilter(atoms, mask=[True, True, True, False, False, False], scalar_pressure=p_eV)
+    filt = FrechetCellFilter(atoms, scalar_pressure=p_eV)
+    #filt = UnitCellFilter(atoms, mask=[True, True, True, False, False, False], scalar_pressure=p_eV)
 
-    #log.info(f"  FIRE  fmax = {cfg.relax_fmax*10:.4f} eV/Å …")
-    #FIRE(filt, logfile=str(out_dir / "relax_FIRE.log")).run(
-    #    fmax=cfg.relax_fmax * 10, steps=cfg.relax_steps // 2
-    #)
+    log.info(f"  FIRE  fmax = {cfg.relax_fmax*10:.4f} eV/Å …")
+    FIRE(filt, logfile=str(out_dir / "relax_FIRE.log")).run(
+        fmax=cfg.relax_fmax * 10, steps=cfg.relax_steps // 2
+    )
     log.info(f"  BFGS  fmax = {cfg.relax_fmax:.5f} eV/Å …")
     BFGS(filt, logfile=str(out_dir / "relax_BFGS.log")).run(
         fmax=cfg.relax_fmax, steps=cfg.relax_steps
@@ -734,10 +754,7 @@ def load_ph3_from_disk(out_dir: Path, cfg: Config) -> Phono3py:
 
     if not cfg.skip_fc_symmetrize:
         # An unsymmetrized SCPH-fit FC2 can leave a Gamma-acoustic residual that leaks past --cutoff_frequency into coherence sums.
-        t0 = time.time()
-        ph3.symmetrize_fc2()
-        ph3.symmetrize_fc3()
-        logging.info(f"  Symmetrized loaded FC2/FC3 ({time.time()-t0:.1f}s)")
+        _symmetrize_fc(ph3)
 
     return ph3
 
